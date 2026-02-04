@@ -12,12 +12,13 @@ class AtlasTrainer:
     """
 
     def __init__(self, config: PrometheusConfig, data_queue: Queue,
-                 weights_queue: Queue, device: str, shared_values: dict):
+                 weights_queue: Queue, device: str, shared_values: dict, shared_lock: Lock):
         self.config = config
         self.data_queue = data_queue
         self.weights_queue = weights_queue
         self.device = device
         self.shared_values = shared_values
+        self.shared_lock = shared_lock
 
         self.network = AtlasNetwork(config).to(device)
         self.optimizer = torch.optim.AdamW(
@@ -50,9 +51,12 @@ class AtlasTrainer:
             if len(self.replay_buffer) >= self.config.min_buffer_before_training:
                 with gpu_lock:
                     metrics = self._train_step()
+                    with self.shared_lock:
+                        games = self.shared_values.get('atlas_games', 0)
                     metrics_queue.put({
                         'type': 'atlas_train',
                         'step': self.global_step,
+                        'games': games,
                         **metrics
                     })
 
@@ -69,6 +73,8 @@ class AtlasTrainer:
                 trajectory = self.data_queue.get_nowait()
                 for state, policy, value in trajectory:
                     self.replay_buffer.add(state, policy, value)
+                with self.shared_lock:
+                    self.shared_values['atlas_games'] = self.shared_values.get('atlas_games', 0) + 1
         except:
             pass
 
@@ -110,7 +116,8 @@ class AtlasTrainer:
             self.optimizer.step()
 
         self.global_step += 1
-        self.shared_values['atlas_steps'] = self.global_step
+        with self.shared_lock:
+            self.shared_values['atlas_steps'] = self.global_step
 
         return {
             'loss': loss.item(),
@@ -134,6 +141,7 @@ class AtlasTrainer:
         self.weights_queue.put((weights, self.weights_version))
 
         # Für Checkpoint
-        self.shared_values['atlas_weights'] = weights
-        self.shared_values['atlas_optimizer'] = self.optimizer.state_dict()
-        self.shared_values['atlas_version'] = self.weights_version
+        with self.shared_lock:
+            self.shared_values['atlas_weights'] = weights
+            self.shared_values['atlas_optimizer'] = self.optimizer.state_dict()
+            self.shared_values['atlas_version'] = self.weights_version
