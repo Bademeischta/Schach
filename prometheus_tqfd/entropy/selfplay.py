@@ -42,18 +42,21 @@ class EntropySelfPlayWorker:
             heartbeat_dict[f'entropy_selfplay_{self.worker_id}'] = time.time()
 
             self._maybe_update_weights()
-            trajectory = self._play_game(metrics_queue)
+            trajectory = self._play_game(heartbeat_dict, metrics_queue)
             self.data_queue.put(trajectory)
 
             self.games_played += 1
             self._decay_temperature()
 
-    def _play_game(self, metrics_queue: Queue = None) -> List[Dict]:
+    def _play_game(self, heartbeat_dict: Dict, metrics_queue: Queue = None) -> List[Dict]:
         """Spiele ein komplettes Spiel"""
         trajectory = []
         board = chess.Board()
 
         while not board.is_game_over() and len(trajectory) < 400:
+            # Heartbeat inside loop for long games
+            heartbeat_dict[f'entropy_selfplay_{self.worker_id}'] = time.time()
+
             # Periodic dashboard update
             if metrics_queue and len(trajectory) % 10 == 0:
                 self._send_dashboard_update(metrics_queue, board)
@@ -80,8 +83,6 @@ class EntropySelfPlayWorker:
         # Spielergebnis hinzufügen
         result = self._get_result(board)
         for i, step in enumerate(trajectory):
-            # Perspective: results are usually 1 for White win.
-            # If step i is White's turn (i=0, 2...), perspective is 1.
             perspective = 1 if i % 2 == 0 else -1
             step['game_result'] = result * perspective
 
@@ -116,7 +117,7 @@ class EntropySelfPlayWorker:
 
     def _get_energy(self, board: chess.Board) -> float:
         board_tensor = self.encoder.encode(board).unsqueeze(0).to(self.device)
-        field_tensor = self.field_calc.compute(board).unsqueeze(0).to(self.device)
+        field_tensor = torch.tensor(self.field_calc.compute(board)).unsqueeze(0).float().to(self.device)
 
         with torch.no_grad():
             _, energy = self.network(board_tensor, field_tensor)
@@ -127,7 +128,7 @@ class EntropySelfPlayWorker:
         field_tensor = self.field_calc.compute(board)
         heatmap = get_entropy_heatmap(field_tensor)
         metrics_queue.put({
-            'type': 'entropy_metrics',
+            'type': 'entropy_update',
             'heatmap': heatmap.tolist(),
             'fen': board.fen(),
             'event': 'move',

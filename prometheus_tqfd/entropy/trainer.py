@@ -51,6 +51,7 @@ class EntropyTrainer:
                     metrics_queue.put({
                         'type': 'entropy_train',
                         'step': self.global_step,
+            'games': self.shared_values.get('entropy_games', 0),
                         **metrics
                     })
 
@@ -70,6 +71,7 @@ class EntropyTrainer:
                         (step['legal_count_self'], step['legal_count_opponent'], step['energy_after']),
                         step['game_result']
                     )
+                self.shared_values['entropy_games'] = self.shared_values.get('entropy_games', 0) + 1
         except:
             pass
 

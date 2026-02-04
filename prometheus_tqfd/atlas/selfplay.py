@@ -40,7 +40,7 @@ class AtlasSelfPlayWorker:
             self._maybe_update_weights()
 
             # Spiel spielen
-            trajectory = self._play_game(metrics_queue)
+            trajectory = self._play_game(heartbeat_dict, metrics_queue)
 
             # In Queue schieben
             self.data_queue.put(trajectory)
@@ -62,7 +62,7 @@ class AtlasSelfPlayWorker:
         except:
             pass
 
-    def _play_game(self, metrics_queue: Queue = None) -> List[Tuple[torch.Tensor, torch.Tensor, float]]:
+    def _play_game(self, heartbeat_dict: Dict, metrics_queue: Queue = None) -> List[Tuple[torch.Tensor, torch.Tensor, float]]:
         """Spiele ein komplettes Spiel"""
         trajectory = []
         board = chess.Board()
@@ -70,7 +70,7 @@ class AtlasSelfPlayWorker:
 
         while not board.is_game_over():
             # Heartbeat inside loop for long games
-            # ...
+            heartbeat_dict[f'atlas_selfplay_{self.worker_id}'] = time.time()
 
             # Temperatur-Schedule
             if move_count < self.config.atlas_temperature_moves:
@@ -104,10 +104,6 @@ class AtlasSelfPlayWorker:
         result = self._get_result(board)
         final_trajectory = []
         for i in range(len(trajectory)):
-            # Perspektive: Weiß bei geraden Zügen (0, 2...), Schwarz bei ungeraden (1, 3...)
-            # Wenn i=0, turn=White, perspective=1, value_target = result * 1
-            # Wenn result=1 (White wins), i=0 gets 1.
-            # Wenn i=1, turn=Black, perspective=-1, value_target = result * -1 = -1. Correct.
             perspective = 1 if i % 2 == 0 else -1
             value_target = result * perspective
             final_trajectory.append((trajectory[i][0], trajectory[i][1], value_target))
@@ -118,7 +114,7 @@ class AtlasSelfPlayWorker:
         from prometheus_tqfd.dashboard.heatmaps import get_atlas_heatmap
         heatmap = get_atlas_heatmap(root)
         metrics_queue.put({
-            'type': 'atlas_metrics',
+            'type': 'atlas_update',
             'heatmap': heatmap.tolist(),
             'fen': board.fen(),
             'event': 'move',

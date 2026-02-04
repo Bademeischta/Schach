@@ -43,7 +43,7 @@ def get_elo(name: str, metrics: List[Dict]) -> float:
 
 def get_games(name: str, metrics: List[Dict]) -> int:
     for m in reversed(metrics):
-        if m.get('type') == f'{name}_metrics':
+        if m.get('type') == f'{name}_train':
             return m.get('games', 0)
     return 0
 
@@ -89,37 +89,45 @@ def main():
 
         with col1:
             st.subheader("ATLAS Training")
-            atlas_metrics = [m for m in metrics if m.get('type') == 'atlas_metrics']
-            if atlas_metrics:
-                df = pd.DataFrame(atlas_metrics)
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=df['step'], y=df['loss'], name='Total Loss'))
-                fig.add_trace(go.Scatter(x=df['step'], y=df['policy_loss'], name='Policy Loss'))
-                fig.add_trace(go.Scatter(x=df['step'], y=df['value_loss'], name='Value Loss'))
-                fig.update_layout(yaxis_type="log", title="Atlas Losses")
-                st.plotly_chart(fig, use_container_width=True)
+            atlas_train = [m for m in metrics if m.get('type') == 'atlas_train']
+            if atlas_train:
+                df = pd.DataFrame(atlas_train)
+                if 'step' in df.columns and 'loss' in df.columns:
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(x=df['step'], y=df['loss'], name='Total Loss'))
+                    if 'policy_loss' in df.columns:
+                        fig.add_trace(go.Scatter(x=df['step'], y=df['policy_loss'], name='Policy Loss'))
+                    if 'value_loss' in df.columns:
+                        fig.add_trace(go.Scatter(x=df['step'], y=df['value_loss'], name='Value Loss'))
+                    fig.update_layout(yaxis_type="log", title="Atlas Losses")
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.warning("Atlas metrics found but missing 'step' or 'loss' columns.")
             else:
-                st.info("No ATLAS metrics yet.")
+                st.info("No ATLAS training metrics yet.")
 
         with col2:
             st.subheader("ENTROPY Training")
-            entropy_metrics = [m for m in metrics if m.get('type') == 'entropy_metrics']
-            if entropy_metrics:
-                df = pd.DataFrame(entropy_metrics)
-                fig = go.Figure()
-                for key in ['loss', 'l_entropy', 'l_conservation', 'l_td', 'l_novelty']:
-                    if key in df.columns:
-                        fig.add_trace(go.Scatter(x=df['step'], y=df[key], name=key))
-                fig.update_layout(yaxis_type="log", title="Entropy Hybrid Losses")
-                st.plotly_chart(fig, use_container_width=True)
+            entropy_train = [m for m in metrics if m.get('type') == 'entropy_train']
+            if entropy_train:
+                df = pd.DataFrame(entropy_train)
+                if 'step' in df.columns and 'loss' in df.columns:
+                    fig = go.Figure()
+                    for key in ['loss', 'outcome', 'mobility', 'pressure', 'stability', 'novelty']:
+                        if key in df.columns:
+                            fig.add_trace(go.Scatter(x=df['step'], y=df[key], name=key))
+                    fig.update_layout(yaxis_type="log", title="Entropy Hybrid Losses")
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.warning("Entropy metrics found but missing 'step' or 'loss' columns.")
             else:
-                st.info("No ENTROPY metrics yet.")
+                st.info("No ENTROPY training metrics yet.")
 
     with tab2:
         col1, col2 = st.columns(2)
         with col1:
             st.subheader("ATLAS Value Heatmap")
-            atlas_hm = get_latest_heatmap_data(metrics, 'atlas_metrics')
+            atlas_hm = get_latest_heatmap_data(metrics, 'atlas_update')
             if atlas_hm is not None:
                 st.plotly_chart(render_heatmap(atlas_hm, "MCTS Visit Counts", "Viridis"), use_container_width=True)
             else:
@@ -127,7 +135,7 @@ def main():
 
         with col2:
             st.subheader("ENTROPY Energy Field")
-            entropy_hm = get_latest_heatmap_data(metrics, 'entropy_metrics')
+            entropy_hm = get_latest_heatmap_data(metrics, 'entropy_update')
             if entropy_hm is not None:
                 st.plotly_chart(render_heatmap(entropy_hm, "Energy Field", "Magma"), use_container_width=True)
             else:
@@ -138,16 +146,16 @@ def main():
         fen = get_latest_board_fen(metrics)
         if fen:
             st.write(f"**Current FEN:** `{fen}`")
-            # Display board using a simple text representation or an image if we had a generator
-            # For now, let's use a markdown representation if possible or just the FEN.
             st.code(fen)
 
             # Show game log
-            game_events = [m for m in metrics if 'event' in m and m['event'] == 'move']
+            game_events = [m for m in metrics if m.get('event') == 'move']
             if game_events:
                 st.write("Recent Moves:")
-                for e in game_events[-5:]:
-                    st.write(f"- {e.get('player')}: {e.get('move')}")
+                # Display moves in a table
+                df_moves = pd.DataFrame(game_events[-10:])
+                if 'player' in df_moves.columns and 'move' in df_moves.columns:
+                    st.table(df_moves[['player', 'move']].iloc[::-1])
         else:
             st.info("No live game data available yet.")
 

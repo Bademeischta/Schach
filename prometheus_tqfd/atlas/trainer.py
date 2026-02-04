@@ -53,6 +53,7 @@ class AtlasTrainer:
                     metrics_queue.put({
                         'type': 'atlas_train',
                         'step': self.global_step,
+            'games': self.shared_values.get('atlas_games', 0),
                         **metrics
                     })
 
@@ -69,6 +70,7 @@ class AtlasTrainer:
                 trajectory = self.data_queue.get_nowait()
                 for state, policy, value in trajectory:
                     self.replay_buffer.add(state, policy, value)
+                self.shared_values['atlas_games'] = self.shared_values.get('atlas_games', 0) + 1
         except:
             pass
 
