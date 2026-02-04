@@ -1,6 +1,7 @@
 import torch
 import gc
 import time
+import psutil
 from multiprocessing import Event
 from prometheus_tqfd.config import PrometheusConfig
 from prometheus_tqfd.orchestration.checkpoint import CheckpointManager
@@ -52,3 +53,45 @@ class OOMHandler:
         # 6. Resume
         pause_event.clear()
         print(f"✅ System resumed after OOM.")
+
+class RecoveryManager:
+    def __init__(self, config, stop_event, oom_event):
+        self.config = config
+        self.stop_event = stop_event
+        self.oom_event = oom_event
+        self.oom_count = 0
+
+    def handle_oom(self, process_name):
+        print(f"⚠️ OOM detected in {process_name}")
+        self.oom_event.set()
+        torch.cuda.empty_cache()
+        gc.collect()
+        time.sleep(5)
+        self.oom_event.clear()
+
+    def check_system_health(self):
+        ram_usage = psutil.virtual_memory().percent
+        if ram_usage > 90:
+            return "hot"
+        return "ok"
+
+def guarded_run(target_fn, name, recovery_mgr, *args, **kwargs):
+    restarts = 0
+    max_restarts = 3
+    while restarts < max_restarts and not recovery_mgr.stop_event.is_set():
+        try:
+            target_fn(*args, **kwargs)
+            break
+        except torch.cuda.OutOfMemoryError:
+            recovery_mgr.handle_oom(name)
+            restarts += 1
+        except Exception as e:
+            print(f"Error in {name}: {e}")
+            import traceback
+            traceback.print_exc()
+            restarts += 1
+            time.sleep(5)
+
+    if restarts >= max_restarts:
+        print(f"Process {name} failed after {max_restarts} restarts.")
+        recovery_mgr.stop_event.set()

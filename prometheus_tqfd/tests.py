@@ -30,10 +30,22 @@ def test_mcts_basic():
 def test_tactics_detector():
     config = PrometheusConfig()
     detector = TacticsDetector(config)
-    board = chess.Board("r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3")
-    # Not a mate in 1 position yet, but check basic detection
+
+    # Test Mate-in-1 detection
+    # Position where White can play Qxh7# (if pawn at h7 is gone and king at g8)
+    # Scholar's Mate
+    board = chess.Board("r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5Q2/PPPP1PPP/RNB1K1NR w KQkq - 4 4")
     threats = detector.detect(board)
-    assert 'mate_in_1' in threats
+    assert threats['mate_in_1'] is not None
+    assert threats['mate_in_1'].uci() == "f3f7"
+
+    # Test hanging piece detection
+    board = chess.Board("rnbqkbnr/pppp1ppp/8/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq - 1 2")
+    threats = detector.detect(board)
+    # e5 is attacked by f3 and not defended
+    hanging_squares = [s for s, p in threats['hanging_pieces']]
+    assert chess.E5 in hanging_squares
+
     return True
 
 def test_physics_symmetry():
@@ -42,8 +54,6 @@ def test_physics_symmetry():
     board = chess.Board()
     fields = calc.compute(board)
     assert fields.shape == (3, 8, 8)
-    # White and Black initial positions are symmetrical
-    # Kanal 0 (Masse) sollte anfangs etwa 0-summiert sein oder symmetrisch
     return True
 
 def run_smoke_tests():
@@ -65,6 +75,8 @@ def run_smoke_tests():
                 all_passed = False
         except Exception as e:
             print(f"  ❌ {name} error: {e}")
+            import traceback
+            traceback.print_exc()
             all_passed = False
 
     return all_passed

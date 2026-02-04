@@ -5,8 +5,54 @@ import multiprocessing as mp
 from typing import Dict, List
 from prometheus_tqfd.config import PrometheusConfig
 from prometheus_tqfd.orchestration.checkpoint import CheckpointManager
-from prometheus_tqfd.orchestration.recovery import OOMHandler
+from prometheus_tqfd.orchestration.recovery import OOMHandler, guarded_run
 from prometheus_tqfd.evaluation.arena import Arena
+
+# --- Standalone Runner Functions to avoid pickling 'self' ---
+
+def run_atlas_trainer(config, data_queue, weights_queue, stop_event, pause_event, gpu_lock, heartbeats, metrics_queue, shared_values, device):
+    from prometheus_tqfd.atlas.trainer import AtlasTrainer
+    from prometheus_tqfd.orchestration.checkpoint import CheckpointManager
+    from prometheus_tqfd.orchestration.recovery import OOMHandler
+
+    trainer = AtlasTrainer(config, data_queue, weights_queue, device, shared_values)
+    checkpoint_manager = CheckpointManager(config)
+    oom_handler = OOMHandler(config)
+
+    try:
+        trainer.run(stop_event, pause_event, gpu_lock, heartbeats, metrics_queue)
+    except Exception as e:
+        if "out of memory" in str(e).lower():
+            oom_handler.handle_oom('atlas_trainer', checkpoint_manager, shared_values, pause_event)
+        else:
+            raise e
+
+def run_entropy_trainer(config, data_queue, weights_queue, stop_event, pause_event, gpu_lock, heartbeats, metrics_queue, shared_values, device):
+    from prometheus_tqfd.entropy.trainer import EntropyTrainer
+    from prometheus_tqfd.orchestration.checkpoint import CheckpointManager
+    from prometheus_tqfd.orchestration.recovery import OOMHandler
+
+    trainer = EntropyTrainer(config, data_queue, weights_queue, device, shared_values)
+    checkpoint_manager = CheckpointManager(config)
+    oom_handler = OOMHandler(config)
+
+    try:
+        trainer.run(stop_event, pause_event, gpu_lock, heartbeats, metrics_queue)
+    except Exception as e:
+        if "out of memory" in str(e).lower():
+            oom_handler.handle_oom('entropy_trainer', checkpoint_manager, shared_values, pause_event)
+        else:
+            raise e
+
+def run_atlas_selfplay(config, weights_queue, data_queue, stop_event, heartbeats, worker_id, device, metrics_queue):
+    from prometheus_tqfd.atlas.selfplay import AtlasSelfPlayWorker
+    worker = AtlasSelfPlayWorker(config, weights_queue, data_queue, device, worker_id)
+    worker.run(stop_event, heartbeats, metrics_queue)
+
+def run_entropy_selfplay(config, weights_queue, data_queue, stop_event, heartbeats, worker_id, device, metrics_queue):
+    from prometheus_tqfd.entropy.selfplay import EntropySelfPlayWorker
+    worker = EntropySelfPlayWorker(config, weights_queue, data_queue, device, worker_id)
+    worker.run(stop_event, heartbeats, metrics_queue)
 
 class Supervisor:
     """
@@ -25,6 +71,7 @@ class Supervisor:
         # Events
         self.stop_event = mp.Event()
         self.pause_event = mp.Event()
+        self.oom_event = mp.Event() # Added as in recovery.py guarded_run logic
 
         # Locks
         self.gpu_lock = mp.Lock()
@@ -43,21 +90,39 @@ class Supervisor:
         from prometheus_tqfd.utils.logging import MetricsLogger
         self.metrics_logger = MetricsLogger(config)
 
+        from prometheus_tqfd.orchestration.recovery import RecoveryManager
+        self.recovery_mgr = RecoveryManager(config, self.stop_event, self.oom_event)
+
         # Processes
         self.processes = {}
 
     def start(self):
         """Startet alle Prozesse"""
         # Trainers
-        self._start_process('atlas_trainer', self._run_atlas_trainer)
-        self._start_process('entropy_trainer', self._run_entropy_trainer)
+        self._start_process('atlas_trainer', run_atlas_trainer, (
+            self.config, self.atlas_data_queue, self.atlas_weights_queue,
+            self.stop_event, self.pause_event, self.gpu_lock, self.heartbeats,
+            self.metrics_queue, self.shared_values, self.device
+        ))
+
+        self._start_process('entropy_trainer', run_entropy_trainer, (
+            self.config, self.entropy_data_queue, self.entropy_weights_queue,
+            self.stop_event, self.pause_event, self.gpu_lock, self.heartbeats,
+            self.metrics_queue, self.shared_values, self.device
+        ))
 
         # Self-Play Workers
         for i in range(self.config.num_atlas_selfplay_workers):
-            self._start_process(f'atlas_selfplay_{i}', lambda i=i: self._run_atlas_selfplay(i))
+            self._start_process(f'atlas_selfplay_{i}', run_atlas_selfplay, (
+                self.config, self.atlas_weights_queue, self.atlas_data_queue,
+                self.stop_event, self.heartbeats, i, 'cpu', self.metrics_queue
+            ))
 
         for i in range(self.config.num_entropy_selfplay_workers):
-            self._start_process(f'entropy_selfplay_{i}', lambda i=i: self._run_entropy_selfplay(i))
+            self._start_process(f'entropy_selfplay_{i}', run_entropy_selfplay, (
+                self.config, self.entropy_weights_queue, self.entropy_data_queue,
+                self.stop_event, self.heartbeats, i, 'cpu', self.metrics_queue
+            ))
 
     def run(self):
         """Hauptschleife"""
@@ -69,7 +134,7 @@ class Supervisor:
                 # 1. Heartbeats prüfen
                 self._check_heartbeats()
 
-                # 2. Metrics sammeln und loggen (DRAIN QUEUE)
+                # 2. Metrics sammeln und loggen
                 self._collect_metrics()
 
                 # 3. Checkpoints
@@ -102,8 +167,9 @@ class Supervisor:
                 proc.join(timeout=5)
         print("✅ Supervisor: Shutdown complete.")
 
-    def _start_process(self, name: str, target_fn):
-        p = mp.Process(target=target_fn, name=name, daemon=True)
+    def _start_process(self, name: str, target_fn, args):
+        # Wrap target_fn with guarded_run
+        p = mp.Process(target=guarded_run, args=(target_fn, name, self.recovery_mgr) + args, name=name, daemon=True)
         p.start()
         self.processes[name] = p
         print(f"🚀 Started {name} (PID: {p.pid})")
@@ -126,9 +192,6 @@ class Supervisor:
 
     def _run_evaluation(self):
         print("⚔️ Running Arena Evaluation...")
-        # We need actual models here. This is slightly tricky in the supervisor process.
-        # For simplicity in this script, we'll log that we're doing it.
-        # In a full implementation, we'd load weights into networks.
         from prometheus_tqfd.atlas.network import AtlasNetwork
         from prometheus_tqfd.entropy.network import EntropyNetworkV2
 
@@ -157,45 +220,29 @@ class Supervisor:
                 p.join(timeout=2)
 
         if 'atlas_trainer' in name:
-            self._start_process(name, self._run_atlas_trainer)
+            self._start_process(name, run_atlas_trainer, (
+                self.config, self.atlas_data_queue, self.atlas_weights_queue,
+                self.stop_event, self.pause_event, self.gpu_lock, self.heartbeats,
+                self.metrics_queue, self.shared_values, self.device
+            ))
         elif 'entropy_trainer' in name:
-            self._start_process(name, self._run_entropy_trainer)
+            self._start_process(name, run_entropy_trainer, (
+                self.config, self.entropy_data_queue, self.entropy_weights_queue,
+                self.stop_event, self.pause_event, self.gpu_lock, self.heartbeats,
+                self.metrics_queue, self.shared_values, self.device
+            ))
         elif 'atlas_selfplay' in name:
             i = int(name.split('_')[-1])
-            self._start_process(name, lambda: self._run_atlas_selfplay(i))
+            self._start_process(name, run_atlas_selfplay, (
+                self.config, self.atlas_weights_queue, self.atlas_data_queue,
+                self.stop_event, self.heartbeats, i, 'cpu', self.metrics_queue
+            ))
         elif 'entropy_selfplay' in name:
             i = int(name.split('_')[-1])
-            self._start_process(name, lambda: self._run_entropy_selfplay(i))
-
-    # Runner functions that instantiate the components in the subprocesses
-    def _run_atlas_trainer(self):
-        from prometheus_tqfd.atlas.trainer import AtlasTrainer
-        trainer = AtlasTrainer(self.config, self.atlas_data_queue, self.atlas_weights_queue, self.device, self.shared_values)
-        try:
-            trainer.run(self.stop_event, self.pause_event, self.gpu_lock, self.heartbeats, self.metrics_queue)
-        except Exception as e:
-            if "out of memory" in str(e).lower():
-                self.oom_handler.handle_oom('atlas_trainer', self.checkpoint_manager, self.shared_values, self.pause_event)
-
-    def _run_entropy_trainer(self):
-        from prometheus_tqfd.entropy.trainer import EntropyTrainer
-        trainer = EntropyTrainer(self.config, self.entropy_data_queue, self.entropy_weights_queue, self.device, self.shared_values)
-        try:
-            trainer.run(self.stop_event, self.pause_event, self.gpu_lock, self.heartbeats, self.metrics_queue)
-        except Exception as e:
-            if "out of memory" in str(e).lower():
-                self.oom_handler.handle_oom('entropy_trainer', self.checkpoint_manager, self.shared_values, self.pause_event)
-
-    def _run_atlas_selfplay(self, i: int):
-        from prometheus_tqfd.atlas.selfplay import AtlasSelfPlayWorker
-        # Self-play often on CPU for stability or lower GPU memory
-        worker = AtlasSelfPlayWorker(self.config, self.atlas_weights_queue, self.atlas_data_queue, 'cpu', i)
-        worker.run(self.stop_event, self.heartbeats)
-
-    def _run_entropy_selfplay(self, i: int):
-        from prometheus_tqfd.entropy.selfplay import EntropySelfPlayWorker
-        worker = EntropySelfPlayWorker(self.config, self.entropy_weights_queue, self.entropy_data_queue, 'cpu', i)
-        worker.run(self.stop_event, self.heartbeats)
+            self._start_process(name, run_entropy_selfplay, (
+                self.config, self.entropy_weights_queue, self.entropy_data_queue,
+                self.stop_event, self.heartbeats, i, 'cpu', self.metrics_queue
+            ))
 
 def torch_is_cuda():
     import torch
