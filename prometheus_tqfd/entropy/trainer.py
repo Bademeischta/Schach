@@ -1,5 +1,6 @@
 import time
 import torch
+import random
 from multiprocessing import Queue, Event, Lock
 from typing import Dict
 from prometheus_tqfd.config import PrometheusConfig
@@ -13,12 +14,13 @@ class EntropyTrainer:
     """
 
     def __init__(self, config: PrometheusConfig, data_queue: Queue,
-                 weights_queue: Queue, device: str, shared_values: dict):
+                 weights_queue: Queue, device: str, shared_values: dict, shared_lock: Lock):
         self.config = config
         self.data_queue = data_queue
         self.weights_queue = weights_queue
         self.device = device
         self.shared_values = shared_values
+        self.shared_lock = shared_lock
 
         self.network = EntropyNetworkV2(config).to(device)
         self.loss_fn = EntropyV2Loss(config, device)
@@ -48,10 +50,12 @@ class EntropyTrainer:
             if len(self.replay_buffer) >= self.config.min_buffer_before_training:
                 with gpu_lock:
                     metrics = self._train_step()
+                    with self.shared_lock:
+                        games = self.shared_values.get('entropy_games', 0)
                     metrics_queue.put({
                         'type': 'entropy_train',
                         'step': self.global_step,
-            'games': self.shared_values.get('entropy_games', 0),
+                        'games': games,
                         **metrics
                     })
 
@@ -71,7 +75,8 @@ class EntropyTrainer:
                         (step['legal_count_self'], step['legal_count_opponent'], step['energy_after']),
                         step['game_result']
                     )
-                self.shared_values['entropy_games'] = self.shared_values.get('entropy_games', 0) + 1
+                with self.shared_lock:
+                    self.shared_values['entropy_games'] = self.shared_values.get('entropy_games', 0) + 1
         except:
             pass
 
@@ -161,7 +166,8 @@ class EntropyTrainer:
             self.optimizer.step()
 
         self.global_step += 1
-        self.shared_values['entropy_steps'] = self.global_step
+        with self.shared_lock:
+            self.shared_values['entropy_steps'] = self.global_step
 
         return {
             'loss': loss.item(),
@@ -177,8 +183,7 @@ class EntropyTrainer:
         except:
             pass
         self.weights_queue.put((weights, self.weights_version))
-        self.shared_values['entropy_weights'] = weights
-        self.shared_values['entropy_optimizer'] = self.optimizer.state_dict()
-        self.shared_values['entropy_version'] = self.weights_version
-
-import random
+        with self.shared_lock:
+            self.shared_values['entropy_weights'] = weights
+            self.shared_values['entropy_optimizer'] = self.optimizer.state_dict()
+            self.shared_values['entropy_version'] = self.weights_version

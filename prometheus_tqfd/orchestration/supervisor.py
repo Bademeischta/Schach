@@ -10,12 +10,12 @@ from prometheus_tqfd.evaluation.arena import Arena
 
 # --- Standalone Runner Functions to avoid pickling 'self' ---
 
-def run_atlas_trainer(config, data_queue, weights_queue, stop_event, pause_event, gpu_lock, heartbeats, metrics_queue, shared_values, device):
+def run_atlas_trainer(config, data_queue, weights_queue, stop_event, pause_event, gpu_lock, shared_lock, heartbeats, metrics_queue, shared_values, device):
     from prometheus_tqfd.atlas.trainer import AtlasTrainer
     from prometheus_tqfd.orchestration.checkpoint import CheckpointManager
     from prometheus_tqfd.orchestration.recovery import OOMHandler
 
-    trainer = AtlasTrainer(config, data_queue, weights_queue, device, shared_values)
+    trainer = AtlasTrainer(config, data_queue, weights_queue, device, shared_values, shared_lock)
     checkpoint_manager = CheckpointManager(config)
     oom_handler = OOMHandler(config)
 
@@ -27,12 +27,12 @@ def run_atlas_trainer(config, data_queue, weights_queue, stop_event, pause_event
         else:
             raise e
 
-def run_entropy_trainer(config, data_queue, weights_queue, stop_event, pause_event, gpu_lock, heartbeats, metrics_queue, shared_values, device):
+def run_entropy_trainer(config, data_queue, weights_queue, stop_event, pause_event, gpu_lock, shared_lock, heartbeats, metrics_queue, shared_values, device):
     from prometheus_tqfd.entropy.trainer import EntropyTrainer
     from prometheus_tqfd.orchestration.checkpoint import CheckpointManager
     from prometheus_tqfd.orchestration.recovery import OOMHandler
 
-    trainer = EntropyTrainer(config, data_queue, weights_queue, device, shared_values)
+    trainer = EntropyTrainer(config, data_queue, weights_queue, device, shared_values, shared_lock)
     checkpoint_manager = CheckpointManager(config)
     oom_handler = OOMHandler(config)
 
@@ -75,6 +75,7 @@ class Supervisor:
 
         # Locks
         self.gpu_lock = mp.Lock()
+        self.shared_lock = mp.Lock()
 
         # Queues
         self.atlas_data_queue = mp.Queue(maxsize=100)
@@ -101,13 +102,13 @@ class Supervisor:
         # Trainers
         self._start_process('atlas_trainer', run_atlas_trainer, (
             self.config, self.atlas_data_queue, self.atlas_weights_queue,
-            self.stop_event, self.pause_event, self.gpu_lock, self.heartbeats,
+            self.stop_event, self.pause_event, self.gpu_lock, self.shared_lock, self.heartbeats,
             self.metrics_queue, self.shared_values, self.device
         ))
 
         self._start_process('entropy_trainer', run_entropy_trainer, (
             self.config, self.entropy_data_queue, self.entropy_weights_queue,
-            self.stop_event, self.pause_event, self.gpu_lock, self.heartbeats,
+            self.stop_event, self.pause_event, self.gpu_lock, self.shared_lock, self.heartbeats,
             self.metrics_queue, self.shared_values, self.device
         ))
 
@@ -222,13 +223,13 @@ class Supervisor:
         if 'atlas_trainer' in name:
             self._start_process(name, run_atlas_trainer, (
                 self.config, self.atlas_data_queue, self.atlas_weights_queue,
-                self.stop_event, self.pause_event, self.gpu_lock, self.heartbeats,
+                self.stop_event, self.pause_event, self.gpu_lock, self.shared_lock, self.heartbeats,
                 self.metrics_queue, self.shared_values, self.device
             ))
         elif 'entropy_trainer' in name:
             self._start_process(name, run_entropy_trainer, (
                 self.config, self.entropy_data_queue, self.entropy_weights_queue,
-                self.stop_event, self.pause_event, self.gpu_lock, self.heartbeats,
+                self.stop_event, self.pause_event, self.gpu_lock, self.shared_lock, self.heartbeats,
                 self.metrics_queue, self.shared_values, self.device
             ))
         elif 'atlas_selfplay' in name:
