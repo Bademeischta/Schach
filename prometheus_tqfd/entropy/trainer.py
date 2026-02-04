@@ -39,6 +39,7 @@ class EntropyTrainer:
     def run(self, stop_event: Event, pause_event: Event,
             gpu_lock: Lock, heartbeat_dict: dict, metrics_queue: Queue):
         """Hauptschleife"""
+        print(f"🔥 EntropyTrainer starting on device: {self.device} (Batch Size: {self.config.entropy_batch_size})")
         while not stop_event.is_set():
             heartbeat_dict['entropy_trainer'] = time.time()
 
@@ -87,13 +88,30 @@ class EntropyTrainer:
 
         samples = random.sample(self.replay_buffer.buffer, min(len(self.replay_buffer), batch_size))
 
-        states = torch.stack([s[0][0] for s in samples]).to(self.device, non_blocking=True)
-        fields = torch.stack([s[0][1] for s in samples]).to(self.device, non_blocking=True)
-        features = torch.stack([s[0][2] for s in samples]).to(self.device, non_blocking=True)
-        energy_next = torch.tensor([s[1][2] for s in samples]).float().to(self.device, non_blocking=True).view(-1, 1)
-        legal_self = torch.tensor([s[1][0] for s in samples]).to(self.device, non_blocking=True)
-        legal_opp = torch.tensor([s[1][1] for s in samples]).to(self.device, non_blocking=True)
-        results = torch.tensor([s[2] for s in samples]).float().to(self.device, non_blocking=True)
+        states = torch.stack([s[0][0] for s in samples])
+        fields = torch.stack([s[0][1] for s in samples])
+        features = torch.stack([s[0][2] for s in samples])
+        energy_next = torch.tensor([s[1][2] for s in samples]).float().view(-1, 1)
+        legal_self = torch.tensor([s[1][0] for s in samples])
+        legal_opp = torch.tensor([s[1][1] for s in samples])
+        results = torch.tensor([s[2] for s in samples]).float()
+
+        if self.device == 'cuda':
+            states = states.pin_memory().to(self.device, non_blocking=True)
+            fields = fields.pin_memory().to(self.device, non_blocking=True)
+            features = features.pin_memory().to(self.device, non_blocking=True)
+            energy_next = energy_next.pin_memory().to(self.device, non_blocking=True)
+            legal_self = legal_self.pin_memory().to(self.device, non_blocking=True)
+            legal_opp = legal_opp.pin_memory().to(self.device, non_blocking=True)
+            results = results.pin_memory().to(self.device, non_blocking=True)
+        else:
+            states = states.to(self.device)
+            fields = fields.to(self.device)
+            features = features.to(self.device)
+            energy_next = energy_next.to(self.device)
+            legal_self = legal_self.to(self.device)
+            legal_opp = legal_opp.to(self.device)
+            results = results.to(self.device)
 
         self.optimizer.zero_grad(set_to_none=True)
         device_type = 'cuda' if self.device == 'cuda' else 'cpu'

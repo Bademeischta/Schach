@@ -62,6 +62,7 @@ class Supervisor:
     def __init__(self, config: PrometheusConfig):
         self.config = config
         self.device = 'cuda' if torch_is_cuda() else 'cpu'
+        print(f"🚀 Supervisor initialized with device: {self.device}")
 
         # Shared State
         self.manager = mp.Manager()

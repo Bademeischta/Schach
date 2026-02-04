@@ -37,6 +37,7 @@ class AtlasTrainer:
     def run(self, stop_event: Event, pause_event: Event,
             gpu_lock: Lock, heartbeat_dict: dict, metrics_queue: Queue):
         """Hauptschleife des Trainers"""
+        print(f"🔥 AtlasTrainer starting on device: {self.device} (Batch Size: {self.config.atlas_batch_size})")
         while not stop_event.is_set():
             # Heartbeat
             heartbeat_dict['atlas_trainer'] = time.time()
@@ -86,9 +87,15 @@ class AtlasTrainer:
         """Ein Trainingsschritt"""
         self.network.train()
         states, policies, values = self.replay_buffer.sample(self.config.atlas_batch_size)
-        states = states.to(self.device, non_blocking=True)
-        policies = policies.to(self.device, non_blocking=True)
-        values = values.to(self.device, non_blocking=True)
+
+        if self.device == 'cuda':
+            states = states.pin_memory().to(self.device, non_blocking=True)
+            policies = policies.pin_memory().to(self.device, non_blocking=True)
+            values = values.pin_memory().to(self.device, non_blocking=True)
+        else:
+            states = states.to(self.device)
+            policies = policies.to(self.device)
+            values = values.to(self.device)
 
         self.optimizer.zero_grad(set_to_none=True)
 

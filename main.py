@@ -19,7 +19,7 @@ def setup_directories(config):
     for sub in ['checkpoints', 'metrics', 'games', 'logs']:
         (run_dir / sub).mkdir(parents=True, exist_ok=True)
 
-def start_dashboard(port, run_dir):
+def start_dashboard(port):
     print(f"🚀 Starting Streamlit Dashboard on port {port}...")
     # Start streamlit as a subprocess
     process = subprocess.Popen([
@@ -74,7 +74,7 @@ def main():
             config.use_drive = False
 
     # 7. Start Dashboard
-    dashboard_proc = start_dashboard(config.dashboard_port, run_dir)
+    dashboard_proc = start_dashboard(config.dashboard_port)
 
     # 8. Setup Tunnel
     from prometheus_tqfd.utils.tunneling import setup_tunnel

@@ -152,8 +152,9 @@ def main():
 
             with col_board:
                 st.write("**Aktuelle Stellung:**")
-                # Simple ASCII board in a code block for better alignment
-                st.code(str(board), language=None)
+                import chess.svg
+                board_svg = chess.svg.board(board, size=350)
+                st.write(board_svg, unsafe_allow_html=True)
                 st.write(f"**FEN:** `{fen}`")
 
             with col_log:
