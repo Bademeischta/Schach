@@ -34,6 +34,7 @@ class EntropyTrainer:
         self.replay_buffer = ReplayBuffer(config.entropy_replay_size)
         self.global_step = 0
         self.weights_version = 0
+        self.metrics_accumulator = []
 
     def run(self, stop_event: Event, pause_event: Event,
             gpu_lock: Lock, heartbeat_dict: dict, metrics_queue: Queue):
@@ -42,7 +43,7 @@ class EntropyTrainer:
             heartbeat_dict['entropy_trainer'] = time.time()
 
             if pause_event.is_set():
-                time.sleep(1)
+                time.sleep(0.5)
                 continue
 
             self._collect_data()
@@ -50,14 +51,10 @@ class EntropyTrainer:
             if len(self.replay_buffer) >= self.config.min_buffer_before_training:
                 with gpu_lock:
                     metrics = self._train_step()
-                    with self.shared_lock:
-                        games = self.shared_values.get('entropy_games', 0)
-                    metrics_queue.put({
-                        'type': 'entropy_train',
-                        'step': self.global_step,
-                        'games': games,
-                        **metrics
-                    })
+                    self.metrics_accumulator.append(metrics)
+
+                if self.global_step % 50 == 0:
+                    self._process_periodic_tasks(metrics_queue)
 
                 if self.global_step % self.config.weight_publish_interval == 0:
                     self._publish_weights()
@@ -65,6 +62,7 @@ class EntropyTrainer:
                 time.sleep(1)
 
     def _collect_data(self):
+        new_games = 0
         try:
             while not self.data_queue.empty():
                 trajectory = self.data_queue.get_nowait()
@@ -75,8 +73,11 @@ class EntropyTrainer:
                         (step['legal_count_self'], step['legal_count_opponent'], step['energy_after']),
                         step['game_result']
                     )
+                new_games += 1
+
+            if new_games > 0:
                 with self.shared_lock:
-                    self.shared_values['entropy_games'] = self.shared_values.get('entropy_games', 0) + 1
+                    self.shared_values['entropy_games'] = self.shared_values.get('entropy_games', 0) + new_games
         except:
             pass
 
@@ -84,64 +85,20 @@ class EntropyTrainer:
         self.network.train()
         batch_size = self.config.entropy_batch_size
 
-        states_batch = []
-        fields_batch = []
-        features_batch = []
-        policy_logits_batch = []
-        legal_self_batch = []
-        legal_opp_batch = []
-        energy_next_batch = []
-        results_batch = []
-
-        data = self.replay_buffer.sample(batch_size)
-        # data is (states, policies, values) from ReplayBuffer.
-        # But for entropy we stored tuples in those positions.
-
-        # Wait, the ReplayBuffer I wrote is:
-        # def add(self, state, policy, value):
-        #    self.buffer.append((state, policy, value))
-        # def sample(self, batch_size: int):
-        #    batch = random.sample(self.buffer, min(len(self.buffer), batch_size))
-        #    states, policies, values = zip(*batch)
-        #    return (torch.stack(states), torch.stack(policies), torch.tensor(values))
-
-        # In EntropyTrainer._collect_data:
-        # self.replay_buffer.add(
-        #     (step['board_tensor'], step['field_tensor'], step['features'], step['policy_logits']),
-        #     (step['legal_count_self'], step['legal_count_opponent'], step['energy_after']),
-        #     step['game_result']
-        # )
-
-        # So we need to unpack.
         samples = random.sample(self.replay_buffer.buffer, min(len(self.replay_buffer), batch_size))
 
-        for (s_tup, p_tup, res) in samples:
-            states_batch.append(s_tup[0])
-            fields_batch.append(s_tup[1])
-            features_batch.append(s_tup[2])
-            policy_logits_batch.append(s_tup[3])
-            legal_self_batch.append(p_tup[0])
-            legal_opp_batch.append(p_tup[1])
-            energy_next_batch.append(p_tup[2])
-            results_batch.append(res)
+        states = torch.stack([s[0][0] for s in samples]).to(self.device, non_blocking=True)
+        fields = torch.stack([s[0][1] for s in samples]).to(self.device, non_blocking=True)
+        features = torch.stack([s[0][2] for s in samples]).to(self.device, non_blocking=True)
+        energy_next = torch.tensor([s[1][2] for s in samples]).float().to(self.device, non_blocking=True).view(-1, 1)
+        legal_self = torch.tensor([s[1][0] for s in samples]).to(self.device, non_blocking=True)
+        legal_opp = torch.tensor([s[1][1] for s in samples]).to(self.device, non_blocking=True)
+        results = torch.tensor([s[2] for s in samples]).float().to(self.device, non_blocking=True)
 
-        states = torch.stack(states_batch).to(self.device)
-        fields = torch.stack(fields_batch).to(self.device)
-        features = torch.stack(features_batch).to(self.device)
-        # policy_logits from buffer are precomputed, but we want the ones from the current model during training?
-        # Actually mobility loss uses policy_logits from current forward pass.
-
-        energy_next = torch.tensor(energy_next_batch).float().to(self.device).view(-1, 1)
-        legal_self = torch.tensor(legal_self_batch).to(self.device)
-        legal_opp = torch.tensor(legal_opp_batch).to(self.device)
-        results = torch.tensor(results_batch).float().to(self.device)
-
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         device_type = 'cuda' if self.device == 'cuda' else 'cpu'
-
         with torch.autocast(device_type=device_type):
             policy_logits, energy = self.network(states, fields)
-
             batch_data = {
                 'states': states,
                 'policy_logits': policy_logits,
@@ -151,7 +108,6 @@ class EntropyTrainer:
                 'legal_counts_opponent': legal_opp,
                 'features': features
             }
-
             loss, loss_dict = self.loss_fn.compute(batch_data, results)
 
         if self.scaler:
@@ -166,13 +122,28 @@ class EntropyTrainer:
             self.optimizer.step()
 
         self.global_step += 1
-        with self.shared_lock:
-            self.shared_values['entropy_steps'] = self.global_step
-
         return {
             'loss': loss.item(),
             **loss_dict
         }
+
+    def _process_periodic_tasks(self, metrics_queue: Queue):
+        with self.shared_lock:
+            self.shared_values['entropy_steps'] = self.global_step
+            games = self.shared_values.get('entropy_games', 0)
+
+        if self.metrics_accumulator:
+            avg_metrics = {
+                k: sum(m[k] for m in self.metrics_accumulator) / len(self.metrics_accumulator)
+                for k in self.metrics_accumulator[0]
+            }
+            metrics_queue.put({
+                'type': 'entropy_train',
+                'step': self.global_step,
+                'games': games,
+                **avg_metrics
+            })
+            self.metrics_accumulator = []
 
     def _publish_weights(self):
         self.weights_version += 1

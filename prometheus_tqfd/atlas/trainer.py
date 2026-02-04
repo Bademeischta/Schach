@@ -30,7 +30,9 @@ class AtlasTrainer:
 
         self.replay_buffer = ReplayBuffer(config.atlas_replay_size)
         self.global_step = 0
+        self.local_game_count = 0
         self.weights_version = 0
+        self.metrics_accumulator = []
 
     def run(self, stop_event: Event, pause_event: Event,
             gpu_lock: Lock, heartbeat_dict: dict, metrics_queue: Queue):
@@ -41,7 +43,7 @@ class AtlasTrainer:
 
             # Pause prüfen
             if pause_event.is_set():
-                time.sleep(1)
+                time.sleep(0.5)
                 continue
 
             # Daten aus Queue holen
@@ -51,16 +53,13 @@ class AtlasTrainer:
             if len(self.replay_buffer) >= self.config.min_buffer_before_training:
                 with gpu_lock:
                     metrics = self._train_step()
-                    with self.shared_lock:
-                        games = self.shared_values.get('atlas_games', 0)
-                    metrics_queue.put({
-                        'type': 'atlas_train',
-                        'step': self.global_step,
-                        'games': games,
-                        **metrics
-                    })
+                    self.metrics_accumulator.append(metrics)
 
-                # Gewichte publishen
+                # Periodisches Logging und Synchronisierung (alle 50 Steps)
+                if self.global_step % 50 == 0:
+                    self._process_periodic_tasks(metrics_queue)
+
+                # Gewichte publishen (alle X intervalle)
                 if self.global_step % self.config.weight_publish_interval == 0:
                     self._publish_weights()
             else:
@@ -68,13 +67,18 @@ class AtlasTrainer:
 
     def _collect_data(self):
         """Trajektorien aus Queue in Replay Buffer"""
+        new_games = 0
         try:
             while not self.data_queue.empty():
                 trajectory = self.data_queue.get_nowait()
                 for state, policy, value in trajectory:
                     self.replay_buffer.add(state, policy, value)
+                new_games += 1
+
+            if new_games > 0:
+                self.local_game_count += new_games
                 with self.shared_lock:
-                    self.shared_values['atlas_games'] = self.shared_values.get('atlas_games', 0) + 1
+                    self.shared_values['atlas_games'] = self.shared_values.get('atlas_games', 0) + new_games
         except:
             pass
 
@@ -82,26 +86,18 @@ class AtlasTrainer:
         """Ein Trainingsschritt"""
         self.network.train()
         states, policies, values = self.replay_buffer.sample(self.config.atlas_batch_size)
-        states = states.to(self.device)
-        policies = policies.to(self.device)
-        values = values.to(self.device)
+        states = states.to(self.device, non_blocking=True)
+        policies = policies.to(self.device, non_blocking=True)
+        values = values.to(self.device, non_blocking=True)
 
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
 
-        # Cast to device-appropriate autocast
         device_type = 'cuda' if self.device == 'cuda' else 'cpu'
-
         with torch.autocast(device_type=device_type):
             policy_logits, value_pred = self.network(states)
-
-            # Policy Loss: Cross-Entropy
             log_probs = F.log_softmax(policy_logits, dim=1)
             policy_loss = -torch.sum(policies * log_probs, dim=1).mean()
-
-            # Value Loss: MSE
             value_loss = F.mse_loss(value_pred.squeeze(-1), values)
-
-            # Total Loss
             loss = policy_loss + value_loss
 
         if self.scaler:
@@ -116,15 +112,32 @@ class AtlasTrainer:
             self.optimizer.step()
 
         self.global_step += 1
-        with self.shared_lock:
-            self.shared_values['atlas_steps'] = self.global_step
-
         return {
             'loss': loss.item(),
             'policy_loss': policy_loss.item(),
             'value_loss': value_loss.item(),
             'grad_norm': grad_norm.item() if grad_norm is not None else 0.0
         }
+
+    def _process_periodic_tasks(self, metrics_queue: Queue):
+        # 1. Update shared steps
+        with self.shared_lock:
+            self.shared_values['atlas_steps'] = self.global_step
+            games = self.shared_values.get('atlas_games', 0)
+
+        # 2. Average metrics and log
+        if self.metrics_accumulator:
+            avg_metrics = {
+                k: sum(m[k] for m in self.metrics_accumulator) / len(self.metrics_accumulator)
+                for k in self.metrics_accumulator[0]
+            }
+            metrics_queue.put({
+                'type': 'atlas_train',
+                'step': self.global_step,
+                'games': games,
+                **avg_metrics
+            })
+            self.metrics_accumulator = []
 
     def _publish_weights(self):
         """Gewichte an Self-Play-Worker senden"""

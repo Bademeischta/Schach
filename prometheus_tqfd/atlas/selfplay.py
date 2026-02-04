@@ -81,8 +81,8 @@ class AtlasSelfPlayWorker:
             # MCTS
             root = self.mcts.search(board)
 
-            # Periodic dashboard update
-            if metrics_queue and move_count % 10 == 0:
+            # Periodic dashboard update (only from worker 0, every 20 moves)
+            if metrics_queue and self.worker_id == 0 and move_count % 20 == 0:
                 self._send_dashboard_update(metrics_queue, board, root)
 
             # Daten sammeln
