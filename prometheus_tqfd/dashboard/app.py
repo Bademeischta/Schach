@@ -142,22 +142,30 @@ def main():
                 st.info("Waiting for Entropy heatmap data...")
 
     with tab3:
-        st.subheader("Live-Spiel Monitoring")
+        st.subheader("Live-Spiel Monitoring (Spielberg)")
         fen = get_latest_board_fen(metrics)
         if fen:
-            st.write(f"**Current FEN:** `{fen}`")
-            st.code(fen)
+            import chess
+            board = chess.Board(fen)
 
-            # Show game log
-            game_events = [m for m in metrics if m.get('event') == 'move']
-            if game_events:
-                st.write("Recent Moves:")
-                # Display moves in a table
-                df_moves = pd.DataFrame(game_events[-10:])
-                if 'player' in df_moves.columns and 'move' in df_moves.columns:
-                    st.table(df_moves[['player', 'move']].iloc[::-1])
+            col_board, col_log = st.columns([2, 1])
+
+            with col_board:
+                st.write("**Aktuelle Stellung:**")
+                # Simple ASCII board in a code block for better alignment
+                st.code(str(board), language=None)
+                st.write(f"**FEN:** `{fen}`")
+
+            with col_log:
+                # Show game log
+                game_events = [m for m in metrics if m.get('event') == 'move']
+                if game_events:
+                    st.write("**Letzte Züge:**")
+                    df_moves = pd.DataFrame(game_events[-15:])
+                    if 'player' in df_moves.columns and 'move' in df_moves.columns:
+                        st.table(df_moves[['player', 'move']].iloc[::-1])
         else:
-            st.info("No live game data available yet.")
+            st.info("Keine Live-Spieldaten verfügbar. Training muss erst Daten generieren.")
 
 if __name__ == '__main__':
     main()
