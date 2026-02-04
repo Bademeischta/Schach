@@ -114,8 +114,8 @@ def adjust_config_for_hardware(config: PrometheusConfig, hw: HardwareConfig) -> 
     Erkennt Hardware und setzt optimale Parameter.
     """
     if hw.device == 'cpu':
-        config.atlas_batch_size = 32
-        config.entropy_batch_size = 16
+        config.atlas_batch_size = 64
+        config.entropy_batch_size = 32
         config.atlas_res_blocks = 5
         config.atlas_mcts_simulations = 50
         config.atlas_replay_size = 100_000
@@ -124,26 +124,29 @@ def adjust_config_for_hardware(config: PrometheusConfig, hw: HardwareConfig) -> 
     vram_gb = hw.vram_gb or 0.0
 
     if vram_gb >= 40:  # A100
+        config.atlas_batch_size = 1024
+        config.atlas_mcts_simulations = 800
+        config.atlas_res_blocks = 15
+        config.atlas_replay_size = 2_000_000
+        config.entropy_batch_size = 512
+        config.entropy_replay_size = 1_000_000
+    elif vram_gb >= 16:  # V100 / T4-Pro
         config.atlas_batch_size = 512
         config.atlas_mcts_simulations = 400
         config.atlas_res_blocks = 12
         config.atlas_replay_size = 1_000_000
         config.entropy_batch_size = 256
         config.entropy_replay_size = 500_000
-    elif vram_gb >= 16:  # V100 / T4-Pro
-        # Defaults sind bereits T4-optimiert
-        config.atlas_batch_size = 128
-        config.atlas_mcts_simulations = 100
-        config.atlas_res_blocks = 8
-        config.atlas_replay_size = 300_000
     elif vram_gb >= 12:  # T4-Free
+        config.atlas_batch_size = 512
+        config.atlas_mcts_simulations = 200
+        config.atlas_res_blocks = 10
+        config.atlas_replay_size = 500_000
+        config.entropy_batch_size = 256
+        config.entropy_replay_size = 300_000
+    else:  # < 8GB (z.B. K80 oder kleine lokale GPU)
         config.atlas_batch_size = 128
         config.atlas_mcts_simulations = 100
-        config.atlas_res_blocks = 8
-        config.atlas_replay_size = 300_000
-    else:  # < 8GB (z.B. K80 oder kleine lokale GPU)
-        config.atlas_batch_size = 32
-        config.atlas_mcts_simulations = 50
         config.atlas_res_blocks = 5
         config.atlas_replay_size = 100_000
         config.entropy_batch_size = 32
