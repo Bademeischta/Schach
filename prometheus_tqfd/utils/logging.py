@@ -1,17 +1,14 @@
 import json
-import os
+import time
 from pathlib import Path
 
 class MetricsLogger:
-    def __init__(self, run_dir):
-        self.metrics_dir = run_dir / 'metrics'
-        self.metrics_dir.mkdir(parents=True, exist_ok=True)
-        self.metrics_file = self.metrics_dir / 'metrics.jsonl'
-        self.f = open(self.metrics_file, 'a', buffering=1)
+    def __init__(self, config):
+        self.config = config
+        self.log_file = config.base_dir / config.run_id / 'metrics' / 'metrics.jsonl'
+        self.log_file.parent.mkdir(parents=True, exist_ok=True)
 
-    def log(self, data):
-        data['timestamp'] = os.times().elapsed
-        self.f.write(json.dumps(data) + '\n')
-
-    def close(self):
-        self.f.close()
+    def log(self, metrics):
+        metrics['timestamp'] = time.time()
+        with open(self.log_file, 'a') as f:
+            f.write(json.dumps(metrics) + '\n')

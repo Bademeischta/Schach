@@ -1,102 +1,139 @@
+import time
 import torch
 import torch.nn.functional as F
-from torch.optim import AdamW
-from torch.cuda.amp import GradScaler, autocast
-from collections import deque
-import random
-import time
-
-class ReplayBuffer:
-    def __init__(self, capacity):
-        self.buffer = deque(maxlen=capacity)
-
-    def add(self, trajectory):
-        for step in trajectory:
-            self.buffer.append(step)
-
-    def sample(self, batch_size):
-        batch = random.sample(self.buffer, batch_size)
-        states = torch.stack([s['state'] for s in batch])
-        policies = torch.stack([s['policy'] for s in batch])
-        values = torch.tensor([s['value'] for s in batch], dtype=torch.float32)
-        return states, policies, values
-
-    def __len__(self):
-        return len(self.buffer)
+from multiprocessing import Queue, Event, Lock
+from prometheus_tqfd.config import PrometheusConfig
+from prometheus_tqfd.atlas.network import AtlasNetwork
+from prometheus_tqfd.utils.replay_buffer import ReplayBuffer
 
 class AtlasTrainer:
-    def __init__(self, config, data_queue, weights_queue, stop_event, metrics_queue, shared_values=None):
+    """
+    Trainiert das ATLAS-Netzwerk mit Daten aus Self-Play.
+    """
+
+    def __init__(self, config: PrometheusConfig, data_queue: Queue,
+                 weights_queue: Queue, device: str, shared_values: dict):
         self.config = config
         self.data_queue = data_queue
         self.weights_queue = weights_queue
-        self.stop_event = stop_event
-        self.metrics_queue = metrics_queue
+        self.device = device
         self.shared_values = shared_values
 
-        from prometheus_tqfd.atlas.network import AtlasNetwork
-        self.network = AtlasNetwork(config).to(config.device)
-        self.optimizer = AdamW(self.network.parameters(), lr=config.atlas_learning_rate, weight_decay=config.atlas_weight_decay)
-        self.scaler = GradScaler()
+        self.network = AtlasNetwork(config).to(device)
+        self.optimizer = torch.optim.AdamW(
+            self.network.parameters(),
+            lr=config.atlas_learning_rate,
+            weight_decay=config.atlas_weight_decay
+        )
+        self.scaler = torch.cuda.amp.GradScaler() if device == 'cuda' else None
 
         self.replay_buffer = ReplayBuffer(config.atlas_replay_size)
         self.global_step = 0
-        self.games_played = 0
+        self.weights_version = 0
 
-    def run(self):
-        print("Atlas Trainer started.")
-        while not self.stop_event.is_set():
-            # Collect data
-            while not self.data_queue.empty():
-                trajectory = self.data_queue.get()
-                self.replay_buffer.add(trajectory)
-                self.games_played += 1
+    def run(self, stop_event: Event, pause_event: Event,
+            gpu_lock: Lock, heartbeat_dict: dict, metrics_queue: Queue):
+        """Hauptschleife des Trainers"""
+        while not stop_event.is_set():
+            # Heartbeat
+            heartbeat_dict['atlas_trainer'] = time.time()
 
-            # Train if enough data
-            if len(self.replay_buffer) >= self.config.min_buffer_before_training:
-                self._train_step()
-
-                if self.global_step % self.config.weight_publish_interval == 0:
-                    state_dict = self.network.state_dict()
-                    self.weights_queue.put(state_dict)
-                    if self.shared_values is not None:
-                        self.shared_values['atlas_weights'] = state_dict
-                        self.shared_values['atlas_opt_state'] = self.optimizer.state_dict()
-                        self.shared_values['atlas_steps'] = self.global_step
-                        self.shared_values['atlas_games'] = self.games_played
-            else:
+            # Pause prüfen
+            if pause_event.is_set():
                 time.sleep(1)
+                continue
 
-    def _train_step(self):
+            # Daten aus Queue holen
+            self._collect_data()
+
+            # Training wenn genug Daten
+            if len(self.replay_buffer) >= self.config.min_buffer_before_training:
+                with gpu_lock:
+                    metrics = self._train_step()
+                    metrics_queue.put({
+                        'type': 'atlas_train',
+                        'step': self.global_step,
+                        **metrics
+                    })
+
+                # Gewichte publishen
+                if self.global_step % self.config.weight_publish_interval == 0:
+                    self._publish_weights()
+            else:
+                time.sleep(1) # Wait for data
+
+    def _collect_data(self):
+        """Trajektorien aus Queue in Replay Buffer"""
+        try:
+            while not self.data_queue.empty():
+                trajectory = self.data_queue.get_nowait()
+                for state, policy, value in trajectory:
+                    self.replay_buffer.add(state, policy, value)
+        except:
+            pass
+
+    def _train_step(self) -> dict:
+        """Ein Trainingsschritt"""
         self.network.train()
-        states, target_policies, target_values = self.replay_buffer.sample(self.config.atlas_batch_size)
-        states, target_policies, target_values = states.to(self.config.device), target_policies.to(self.config.device), target_values.to(self.config.device)
+        states, policies, values = self.replay_buffer.sample(self.config.atlas_batch_size)
+        states = states.to(self.device)
+        policies = policies.to(self.device)
+        values = values.to(self.device)
 
         self.optimizer.zero_grad()
-        with autocast():
+
+        # Cast to device-appropriate autocast
+        device_type = 'cuda' if self.device == 'cuda' else 'cpu'
+
+        with torch.autocast(device_type=device_type):
             policy_logits, value_pred = self.network(states)
 
-            # Policy loss: Cross-entropy
+            # Policy Loss: Cross-Entropy
             log_probs = F.log_softmax(policy_logits, dim=1)
-            policy_loss = -torch.sum(target_policies * log_probs, dim=1).mean()
+            policy_loss = -torch.sum(policies * log_probs, dim=1).mean()
 
-            # Value loss: MSE
-            value_loss = F.mse_loss(value_pred.view(-1), target_values)
+            # Value Loss: MSE
+            value_loss = F.mse_loss(value_pred.squeeze(-1), values)
 
-            total_loss = policy_loss + value_loss
+            # Total Loss
+            loss = policy_loss + value_loss
 
-        self.scaler.scale(total_loss).backward()
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
+        if self.scaler:
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.network.parameters(), 1.0)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.network.parameters(), 1.0)
+            self.optimizer.step()
 
         self.global_step += 1
+        self.shared_values['atlas_steps'] = self.global_step
 
-        # Log metrics
-        self.metrics_queue.put({
-            'type': 'atlas_metrics',
-            'step': self.global_step,
-            'loss': total_loss.item(),
+        return {
+            'loss': loss.item(),
             'policy_loss': policy_loss.item(),
             'value_loss': value_loss.item(),
-            'games': self.games_played,
-            'buffer_size': len(self.replay_buffer)
-        })
+            'grad_norm': grad_norm.item() if grad_norm is not None else 0.0
+        }
+
+    def _publish_weights(self):
+        """Gewichte an Self-Play-Worker senden"""
+        self.weights_version += 1
+        weights = {k: v.cpu() for k, v in self.network.state_dict().items()}
+
+        # Queue leeren und neue Gewichte einfügen
+        try:
+            while not self.weights_queue.empty():
+                self.weights_queue.get_nowait()
+        except:
+            pass
+
+        self.weights_queue.put((weights, self.weights_version))
+
+        # Für Checkpoint
+        self.shared_values['atlas_weights'] = weights
+        self.shared_values['atlas_optimizer'] = self.optimizer.state_dict()
+        self.shared_values['atlas_version'] = self.weights_version

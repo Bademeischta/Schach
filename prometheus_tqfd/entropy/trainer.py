@@ -1,122 +1,182 @@
-import torch
-from torch.optim import AdamW
-from torch.cuda.amp import GradScaler, autocast
-from collections import deque
-import random
 import time
-from prometheus_tqfd.entropy.rnd import RNDTarget, RNDPredictor
-from prometheus_tqfd.entropy.loss import compute_total_entropy_loss
-
-class EntropyReplayBuffer:
-    def __init__(self, capacity):
-        self.buffer = deque(maxlen=capacity)
-
-    def add(self, trajectory):
-        for i in range(len(trajectory) - 1):
-            step = trajectory[i]
-            next_step = trajectory[i+1]
-            pair = {
-                'field': step['field'],
-                'board': step['board'],
-                'mask': step['mask'],
-                'opp_legal_count': step['opp_legal_count'],
-                'energy_captured': step['e_captured'],
-                'energy_before': step['energy_before'],
-                'energy_next': next_step['energy_before'],
-                'energy_diff': next_step['energy_before'] - step['energy_before']
-            }
-            self.buffer.append(pair)
-
-    def sample(self, batch_size):
-        batch = random.sample(self.buffer, batch_size)
-        return {
-            'fields': torch.stack([item['field'] for item in batch]),
-            'boards': torch.stack([item['board'] for item in batch]),
-            'masks': torch.stack([item['mask'] for item in batch]),
-            'opp_legal_counts': torch.tensor([item['opp_legal_count'] for item in batch]),
-            'energy_captured': torch.tensor([item['energy_captured'] for item in batch], dtype=torch.float32),
-            'energy_next': torch.tensor([item['energy_next'] for item in batch], dtype=torch.float32),
-            'energy_diff': torch.tensor([item['energy_diff'] for item in batch], dtype=torch.float32)
-        }
-
-    def __len__(self):
-        return len(self.buffer)
+import torch
+from multiprocessing import Queue, Event, Lock
+from typing import Dict
+from prometheus_tqfd.config import PrometheusConfig
+from prometheus_tqfd.entropy.network import EntropyNetworkV2
+from prometheus_tqfd.entropy.loss import EntropyV2Loss
+from prometheus_tqfd.utils.replay_buffer import ReplayBuffer
 
 class EntropyTrainer:
-    def __init__(self, config, data_queue, weights_queue, stop_event, metrics_queue, shared_values=None):
+    """
+    Trainiert das ENTROPY-Netzwerk.
+    """
+
+    def __init__(self, config: PrometheusConfig, data_queue: Queue,
+                 weights_queue: Queue, device: str, shared_values: dict):
         self.config = config
         self.data_queue = data_queue
         self.weights_queue = weights_queue
-        self.stop_event = stop_event
-        self.metrics_queue = metrics_queue
+        self.device = device
         self.shared_values = shared_values
 
-        from prometheus_tqfd.entropy.network import EntropyNetwork
-        self.network = EntropyNetwork(config).to(config.device)
-        self.optimizer = AdamW(self.network.parameters(), lr=config.entropy_learning_rate)
+        self.network = EntropyNetworkV2(config).to(device)
+        self.loss_fn = EntropyV2Loss(config, device)
 
-        self.rnd_target = RNDTarget(1024, config.entropy_rnd_feature_dim).to(config.device)
-        self.rnd_predictor = RNDPredictor(1024, config.entropy_rnd_feature_dim).to(config.device)
-        self.rnd_optimizer = AdamW(self.rnd_predictor.parameters(), lr=1e-4)
+        self.optimizer = torch.optim.AdamW(
+            list(self.network.parameters()) + list(self.loss_fn.rnd_predictor.parameters()),
+            lr=config.entropy_learning_rate
+        )
+        self.scaler = torch.cuda.amp.GradScaler() if device == 'cuda' else None
 
-        self.scaler = GradScaler()
-        self.replay_buffer = EntropyReplayBuffer(config.entropy_replay_size)
+        self.replay_buffer = ReplayBuffer(config.entropy_replay_size)
         self.global_step = 0
-        self.games_played = 0
+        self.weights_version = 0
 
-    def run(self):
-        print("Entropy Trainer started.")
-        while not self.stop_event.is_set():
-            while not self.data_queue.empty():
-                trajectory = self.data_queue.get()
-                self.replay_buffer.add(trajectory)
-                self.games_played += 1
+    def run(self, stop_event: Event, pause_event: Event,
+            gpu_lock: Lock, heartbeat_dict: dict, metrics_queue: Queue):
+        """Hauptschleife"""
+        while not stop_event.is_set():
+            heartbeat_dict['entropy_trainer'] = time.time()
+
+            if pause_event.is_set():
+                time.sleep(1)
+                continue
+
+            self._collect_data()
 
             if len(self.replay_buffer) >= self.config.min_buffer_before_training:
-                self._train_step()
+                with gpu_lock:
+                    metrics = self._train_step()
+                    metrics_queue.put({
+                        'type': 'entropy_train',
+                        'step': self.global_step,
+                        **metrics
+                    })
 
                 if self.global_step % self.config.weight_publish_interval == 0:
-                    state_dict = self.network.state_dict()
-                    self.weights_queue.put(state_dict)
-                    if self.shared_values is not None:
-                        self.shared_values['entropy_weights'] = state_dict
-                        self.shared_values['entropy_opt_state'] = self.optimizer.state_dict()
-                        self.shared_values['entropy_steps'] = self.global_step
-                        self.shared_values['entropy_games'] = self.games_played
+                    self._publish_weights()
             else:
                 time.sleep(1)
 
-    def _train_step(self):
+    def _collect_data(self):
+        try:
+            while not self.data_queue.empty():
+                trajectory = self.data_queue.get_nowait()
+                for step in trajectory:
+                    # We need to store (board, fields, features, policy_logits, legal_count_self, energy_after, legal_count_opponent, game_result)
+                    self.replay_buffer.add(
+                        (step['board_tensor'], step['field_tensor'], step['features'], step['policy_logits']),
+                        (step['legal_count_self'], step['legal_count_opponent'], step['energy_after']),
+                        step['game_result']
+                    )
+        except:
+            pass
+
+    def _train_step(self) -> dict:
         self.network.train()
-        batch = self.replay_buffer.sample(self.config.entropy_batch_size)
-        for k in batch:
-            batch[k] = batch[k].to(self.config.device)
+        batch_size = self.config.entropy_batch_size
+
+        states_batch = []
+        fields_batch = []
+        features_batch = []
+        policy_logits_batch = []
+        legal_self_batch = []
+        legal_opp_batch = []
+        energy_next_batch = []
+        results_batch = []
+
+        data = self.replay_buffer.sample(batch_size)
+        # data is (states, policies, values) from ReplayBuffer.
+        # But for entropy we stored tuples in those positions.
+
+        # Wait, the ReplayBuffer I wrote is:
+        # def add(self, state, policy, value):
+        #    self.buffer.append((state, policy, value))
+        # def sample(self, batch_size: int):
+        #    batch = random.sample(self.buffer, min(len(self.buffer), batch_size))
+        #    states, policies, values = zip(*batch)
+        #    return (torch.stack(states), torch.stack(policies), torch.tensor(values))
+
+        # In EntropyTrainer._collect_data:
+        # self.replay_buffer.add(
+        #     (step['board_tensor'], step['field_tensor'], step['features'], step['policy_logits']),
+        #     (step['legal_count_self'], step['legal_count_opponent'], step['energy_after']),
+        #     step['game_result']
+        # )
+
+        # So we need to unpack.
+        samples = random.sample(self.replay_buffer.buffer, min(len(self.replay_buffer), batch_size))
+
+        for (s_tup, p_tup, res) in samples:
+            states_batch.append(s_tup[0])
+            fields_batch.append(s_tup[1])
+            features_batch.append(s_tup[2])
+            policy_logits_batch.append(s_tup[3])
+            legal_self_batch.append(p_tup[0])
+            legal_opp_batch.append(p_tup[1])
+            energy_next_batch.append(p_tup[2])
+            results_batch.append(res)
+
+        states = torch.stack(states_batch).to(self.device)
+        fields = torch.stack(fields_batch).to(self.device)
+        features = torch.stack(features_batch).to(self.device)
+        # policy_logits from buffer are precomputed, but we want the ones from the current model during training?
+        # Actually mobility loss uses policy_logits from current forward pass.
+
+        energy_next = torch.tensor(energy_next_batch).float().to(self.device).view(-1, 1)
+        legal_self = torch.tensor(legal_self_batch).to(self.device)
+        legal_opp = torch.tensor(legal_opp_batch).to(self.device)
+        results = torch.tensor(results_batch).float().to(self.device)
 
         self.optimizer.zero_grad()
-        self.rnd_optimizer.zero_grad()
+        device_type = 'cuda' if self.device == 'cuda' else 'cpu'
 
-        with autocast():
-            loss, l_ent, l_cons, l_smooth, l_td, l_novel = compute_total_entropy_loss(
-                batch, self.network, self.rnd_target, self.rnd_predictor, self.config
-            )
+        with torch.autocast(device_type=device_type):
+            policy_logits, energy = self.network(states, fields)
 
-        self.scaler.scale(loss).backward()
-        self.scaler.step(self.optimizer)
-        self.scaler.step(self.rnd_optimizer)
-        self.scaler.update()
+            batch_data = {
+                'states': states,
+                'policy_logits': policy_logits,
+                'energy': energy,
+                'energy_next': energy_next,
+                'legal_counts_self': legal_self,
+                'legal_counts_opponent': legal_opp,
+                'features': features
+            }
+
+            loss, loss_dict = self.loss_fn.compute(batch_data, results)
+
+        if self.scaler:
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 1.0)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 1.0)
+            self.optimizer.step()
 
         self.global_step += 1
+        self.shared_values['entropy_steps'] = self.global_step
 
-        # Log metrics
-        self.metrics_queue.put({
-            'type': 'entropy_metrics',
-            'step': self.global_step,
+        return {
             'loss': loss.item(),
-            'l_entropy': l_ent,
-            'l_conservation': l_cons,
-            'l_smoothness': l_smooth,
-            'l_td': l_td,
-            'l_novelty': l_novel,
-            'games': self.games_played,
-            'buffer_size': len(self.replay_buffer)
-        })
+            **loss_dict
+        }
+
+    def _publish_weights(self):
+        self.weights_version += 1
+        weights = {k: v.cpu() for k, v in self.network.state_dict().items()}
+        try:
+            while not self.weights_queue.empty():
+                self.weights_queue.get_nowait()
+        except:
+            pass
+        self.weights_queue.put((weights, self.weights_version))
+        self.shared_values['entropy_weights'] = weights
+        self.shared_values['entropy_optimizer'] = self.optimizer.state_dict()
+        self.shared_values['entropy_version'] = self.weights_version
+
+import random

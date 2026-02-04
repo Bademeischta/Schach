@@ -1,126 +1,162 @@
 import math
-import numpy as np
 import torch
+import torch.nn.functional as F
+import numpy as np
 import chess
-from prometheus_tqfd.encoding import MoveEncoder, BoardEncoder
+from dataclasses import dataclass, field
+from typing import Dict, Optional, List, Tuple
+from prometheus_tqfd.config import PrometheusConfig
+from prometheus_tqfd.atlas.network import AtlasNetwork
+from prometheus_tqfd.encoding import BoardEncoder, MoveEncoder
 
+@dataclass
 class MCTSNode:
-    def __init__(self, board: chess.Board, parent=None, prior=0.0):
-        self.board = board
-        self.parent = parent
-        self.children = {}
-        self.visit_count = 0
-        self.total_value = 0.0
-        self.prior = prior
-        self.is_expanded = False
+    state: chess.Board
+    parent: Optional['MCTSNode'] = None
+    parent_action: Optional[chess.Move] = None
+    children: Dict[chess.Move, 'MCTSNode'] = field(default_factory=dict)
+    visit_count: int = 0
+    total_value: float = 0.0
+    prior: float = 0.0
 
     @property
-    def q_value(self):
-        return self.total_value / self.visit_count if self.visit_count > 0 else 0.0
+    def q_value(self) -> float:
+        if self.visit_count == 0:
+            return 0.0
+        return self.total_value / self.visit_count
 
 class MCTS:
-    def __init__(self, config):
+    """
+    Monte Carlo Tree Search mit PUCT.
+    """
+
+    def __init__(self, config: PrometheusConfig, network: AtlasNetwork, device: str):
         self.config = config
+        self.network = network
+        self.device = device
+        self.encoder = BoardEncoder()
         self.move_encoder = MoveEncoder()
-        self.board_encoder = BoardEncoder()
 
-    def search(self, board: chess.Board, network, device='cpu'):
-        root = MCTSNode(board.copy())
+    def search(self, root_board: chess.Board, num_simulations: int = None) -> MCTSNode:
+        if num_simulations is None:
+            num_simulations = self.config.atlas_mcts_simulations
 
-        # Initial expansion for root
-        self._expand_node(root, network, device)
+        root = MCTSNode(state=root_board.copy())
+
+        # Initial expansion of root
+        self._evaluate_and_expand(root)
         self._add_dirichlet_noise(root)
 
-        for _ in range(self.config.atlas_mcts_simulations):
-            node = root
-            search_path = [node]
-
-            # Selection
-            while node.is_expanded and not node.board.is_game_over():
-                action, node = self._select_child(node)
-                search_path.append(node)
-
-            # Expansion & Evaluation
-            value = self._evaluate(node, network, device)
-
-            # Backpropagation
-            self._backpropagate(search_path, value)
+        for _ in range(num_simulations):
+            node = self._select(root)
+            value = self._evaluate_and_expand(node)
+            self._backpropagate(node, value)
 
         return root
 
-    def _select_child(self, node):
-        best_score = -float('inf')
-        best_action = None
-        best_child = None
+    def _ucb_score(self, parent: MCTSNode, child: MCTSNode) -> float:
+        """PUCT-Formel"""
+        c = self.config.atlas_mcts_cpuct
+        q = child.q_value
+        u = c * child.prior * math.sqrt(parent.visit_count) / (1 + child.visit_count)
+        return q + u
 
-        total_sqrt_n = math.sqrt(sum(child.visit_count for child in node.children.values()))
+    def _select(self, node: MCTSNode) -> MCTSNode:
+        """Traversiere bis Blatt mit max UCB"""
+        while node.children and not node.state.is_game_over():
+            node = max(node.children.values(), key=lambda c: self._ucb_score(node, c))
+        return node
 
-        for action, child in node.children.items():
-            u_score = self.config.atlas_mcts_cpuct_init * child.prior * total_sqrt_n / (1 + child.visit_count)
-            # Standard AlphaZero PUCT
-            # c_puct = log((1 + N_parent + c_base) / c_base) + c_init
-            # For simplicity using fixed C for now, or can implement the full formula
+    def _evaluate_and_expand(self, node: MCTSNode) -> float:
+        """Netzwerk-Inference und Expansion"""
+        if node.state.is_game_over():
+            result = node.state.result()
+            if result == "1-0":
+                v = 1.0 if node.state.turn == chess.BLACK else -1.0
+            elif result == "0-1":
+                v = -1.0 if node.state.turn == chess.BLACK else 1.0
+            else:
+                v = 0.0
+            return v
 
-            score = child.q_value + u_score
-            if score > best_score:
-                best_score = score
-                best_action = action
-                best_child = child
-
-        return best_action, best_child
-
-    def _expand_node(self, node, network, device):
-        if node.board.is_game_over():
-            return
-
+        # Netzwerk-Inference
+        tensor = self.encoder.encode(node.state).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            board_tensor = self.board_encoder.encode(node.board).unsqueeze(0).to(device)
-            policy_logits, _ = network(board_tensor)
+            policy_logits, value = self.network(tensor)
 
-            mask = self.move_encoder.get_legal_mask(node.board).to(device)
-            probs = torch.softmax(policy_logits[0][mask], dim=0).cpu().numpy()
+        # Legal-Mask und Softmax
+        legal_mask = self.move_encoder.get_legal_mask(node.state).to(self.device)
+        policy_logits[~legal_mask.unsqueeze(0)] = float('-inf')
+        policy = F.softmax(policy_logits, dim=1).squeeze(0)
 
-            legal_moves = list(node.board.legal_moves)
-            for move, prob in zip(legal_moves, probs):
-                new_board = node.board.copy()
-                new_board.push(move)
-                node.children[move] = MCTSNode(new_board, parent=node, prior=prob)
+        # Kinder erstellen
+        for move in node.state.legal_moves:
+            idx = self.move_encoder.move_to_index(move)
+            new_board = node.state.copy()
+            new_board.push(move)
+            child = MCTSNode(
+                state=new_board,
+                parent=node,
+                parent_action=move,
+                prior=policy[idx].item()
+            )
+            node.children[move] = child
 
-        node.is_expanded = True
+        return value.item()
 
-    def _evaluate(self, node, network, device):
-        if node.board.is_game_over():
-            res = node.board.result()
-            if res == "1-0": return 1.0 if node.board.turn == chess.BLACK else -1.0
-            if res == "0-1": return 1.0 if node.board.turn == chess.WHITE else -1.0
-            return 0.0
-
-        self._expand_node(node, network, device)
-        with torch.no_grad():
-            board_tensor = self.board_encoder.encode(node.board).unsqueeze(0).to(device)
-            _, value = network(board_tensor)
-            return value.item()
-
-    def _backpropagate(self, search_path, value):
-        for node in reversed(search_path):
+    def _backpropagate(self, node: MCTSNode, value: float):
+        """Value entlang Pfad propagieren mit Vorzeichenwechsel"""
+        while node is not None:
             node.visit_count += 1
             node.total_value += value
-            value = -value
+            value = -value  # Perspektivwechsel
+            node = node.parent
 
-    def _add_dirichlet_noise(self, node):
-        moves = list(node.children.keys())
-        noise = np.random.dirichlet([self.config.atlas_dirichlet_alpha] * len(moves))
-        for i, move in enumerate(moves):
-            node.children[move].prior = (1 - self.config.atlas_dirichlet_epsilon) * node.children[move].prior + \
-                                       self.config.atlas_dirichlet_epsilon * noise[i]
+    def _add_dirichlet_noise(self, root: MCTSNode):
+        """Exploration-Noise am Wurzelknoten"""
+        if not root.children:
+            return
+        alpha = self.config.atlas_dirichlet_alpha
+        epsilon = self.config.atlas_dirichlet_epsilon
+        noise = np.random.dirichlet([alpha] * len(root.children))
+        for i, child in enumerate(root.children.values()):
+            child.prior = (1 - epsilon) * child.prior + epsilon * noise[i]
 
-    def select_action(self, root, temperature=1.0):
+    def get_policy_target(self, root: MCTSNode, temperature: float) -> torch.Tensor:
+        """Normalisierte Visit-Counts als Policy-Target"""
+        policy = torch.zeros(4672)
+        visits = []
+        indices = []
+
+        for move, child in root.children.items():
+            idx = self.move_encoder.move_to_index(move)
+            visits.append(child.visit_count)
+            indices.append(idx)
+
+        visits = torch.tensor(visits, dtype=torch.float32)
+
+        if temperature <= 0.01:
+            # Greedy
+            best_idx = visits.argmax()
+            policy[indices[best_idx]] = 1.0
+        else:
+            # Temperature-Sampling
+            probs = (visits ** (1 / temperature))
+            probs = probs / probs.sum()
+            for i, idx in enumerate(indices):
+                policy[idx] = probs[i]
+
+        return policy
+
+    def select_move(self, root: MCTSNode, temperature: float) -> chess.Move:
+        """Wähle Zug basierend auf Visit-Counts"""
         moves = list(root.children.keys())
-        visit_counts = [child.visit_count for child in root.children.values()]
+        visits = torch.tensor([root.children[m].visit_count for m in moves], dtype=torch.float32)
 
-        if temperature == 0:
-            return moves[np.argmax(visit_counts)]
+        if temperature <= 0.01:
+            return moves[visits.argmax()]
 
-        visit_counts = np.array(visit_counts) ** (1.0 / temperature)
-        probs = visit_counts / visit_counts.sum()
-        return np.random.choice(moves, p=probs)
+        probs = (visits ** (1 / temperature))
+        probs = probs / (probs.sum() + 1e-8)
+        idx = torch.multinomial(probs, 1).item()
+        return moves[idx]

@@ -1,51 +1,97 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+from typing import Dict, Tuple
+from prometheus_tqfd.config import PrometheusConfig
 
-def entropy_loss(policy_self, board_batch):
-    # S_self = -Σ p log p
-    s_self = -torch.sum(policy_self * torch.log(policy_self + 1e-8), dim=-1)
+class EntropyV2Loss:
+    """
+    Hybrid Loss-System für ENTROPY v2.0.
+    """
 
-    # S_opponent approximation: log(num_legal)
-    # We need num_legal_opponent for each board in batch
-    # This might be slow if we calculate it here, but let's assume it's passed
-    pass
+    def __init__(self, config: PrometheusConfig, device: str):
+        self.config = config
+        self.device = device
+        self.weights = {
+            'outcome': config.entropy_loss_outcome,
+            'mobility': config.entropy_loss_mobility,
+            'pressure': config.entropy_loss_pressure,
+            'stability': config.entropy_loss_stability,
+            'novelty': config.entropy_loss_novelty,
+        }
 
-def compute_total_entropy_loss(batch_data, model, rnd_target, rnd_predictor, config):
-    # batch_data contains: field_tensors, board_data, legal_masks, opponent_legal_counts, etc.
-    probs, energy, flow, (real, imag), fused = model(batch_data['fields'], batch_data['boards'], batch_data['masks'])
+        # RND Networks
+        # Input features are C*64, where C is entropy_channels (128) -> 8192
+        # Wait, get_features returns flattened res_tower output.
+        # C=128, kernel 3, padding 1 keeps 8x8. So 128*8*8 = 8192.
+        self.feature_dim = config.entropy_channels * 64
+        self.rnd_target = self._make_rnd_net(frozen=True).to(device)
+        self.rnd_predictor = self._make_rnd_net(frozen=False).to(device)
 
-    # 1. Entropy Ratio Loss
-    s_self = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1)
-    s_opp = torch.log(batch_data['opp_legal_counts'].float() + 1.0)
-    l_ent = -torch.log(s_self / (s_opp + 0.1) + 1e-8).mean()
+    def _make_rnd_net(self, frozen: bool) -> nn.Module:
+        net = nn.Sequential(
+            nn.Linear(self.feature_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128)
+        )
+        if frozen:
+            for param in net.parameters():
+                param.requires_grad = False
+        return net
 
-    # 2. Conservation Loss: |ΔE - E_captured|²
-    # Need e_before, e_after, e_captured
-    # This requires sequential data or pairs of states
-    l_cons = F.mse_loss(batch_data['energy_diff'], -batch_data['energy_captured'])
+    def compute(self, batch: Dict, game_results: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
+        """
+        Berechnet den Gesamtverlust.
+        """
+        losses = {}
 
-    # 3. Smoothness Loss: |∇²Φ|²
-    laplacian_kernel = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]]).float().to(energy.device).view(1, 1, 3, 3)
-    # Φ is part of fields, let's extract it
-    phi = batch_data['fields'][:, 3:4, :, :]
-    laplacian = F.conv2d(phi, laplacian_kernel, padding=1)
-    l_smooth = (laplacian**2).mean()
+        # 1. Outcome Loss (sparse)
+        losses['outcome'] = self._outcome_loss(batch['energy'], game_results)
 
-    # 4. TD Loss (Energy)
-    # E(s) vs γ E(s')
-    target_energy = config.entropy_beta_start * batch_data['energy_next'].detach()
-    l_td = F.mse_loss(energy, target_energy)
+        # 2. Mobility Loss
+        losses['mobility'] = self._mobility_loss(batch['policy_logits'], batch['legal_counts_self'])
 
-    # 5. Novelty Loss
-    rnd_error = torch.mean((rnd_target(fused) - rnd_predictor(fused))**2, dim=-1)
-    l_novel = rnd_error.mean()
+        # 3. Pressure Loss
+        losses['pressure'] = self._pressure_loss(batch['legal_counts_self'], batch['legal_counts_opponent'])
 
-    total_loss = (
-        1.0 * l_ent +
-        config.entropy_loss_weight_conservation * l_cons +
-        config.entropy_loss_weight_smoothness * l_smooth +
-        1.0 * l_td +
-        config.entropy_loss_weight_novelty * l_novel
-    )
+        # 4. Stability Loss (TD)
+        losses['stability'] = self._stability_loss(batch['energy'], batch['energy_next'])
 
-    return total_loss, l_ent.item(), l_cons.item(), l_smooth.item(), l_td.item(), l_novel.item()
+        # 5. Novelty Loss (RND)
+        losses['novelty'] = self._novelty_loss(batch['features'])
+
+        # Gewichtete Summe
+        total = sum(self.weights[k] * losses[k] for k in losses)
+
+        return total, {k: v.item() for k, v in losses.items()}
+
+    def _outcome_loss(self, energy: torch.Tensor, results: torch.Tensor) -> torch.Tensor:
+        target = results.float().view(-1, 1) * 5.0  # Skalierung
+        return F.smooth_l1_loss(energy, target)
+
+    def _mobility_loss(self, policy_logits: torch.Tensor, legal_counts: torch.Tensor) -> torch.Tensor:
+        probs = F.softmax(policy_logits, dim=1)
+        entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=1)
+
+        # Normalisiere mit Anzahl legaler Züge
+        max_entropy = torch.log(legal_counts.float() + 1e-8)
+        normalized_entropy = entropy / (max_entropy + 1e-8)
+
+        return -normalized_entropy.mean()
+
+    def _pressure_loss(self, our_legal: torch.Tensor, opp_legal: torch.Tensor) -> torch.Tensor:
+        ratio = opp_legal.float() / (our_legal.float() + 1.0)
+        return ratio.mean()
+
+    def _stability_loss(self, energy_now: torch.Tensor, energy_next: torch.Tensor) -> torch.Tensor:
+        gamma = 0.99
+        target = gamma * energy_next.detach()
+        return F.mse_loss(energy_now, target)
+
+    def _novelty_loss(self, features: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            target_out = self.rnd_target(features)
+        predictor_out = self.rnd_predictor(features)
+
+        error = ((target_out - predictor_out) ** 2).mean(dim=1)
+        return error.mean()

@@ -8,38 +8,18 @@ from pathlib import Path
 # Add project root to path
 sys.path.append(os.getcwd())
 
-def install_dependencies():
-    print("📦 Installing dependencies...")
-    libs = [
-        "python-chess", "numpy", "torch", "einops", "psutil",
-        "lz4", "safetensors", "plotly", "streamlit", "pyngrok"
-    ]
-    # Check if torch_geometric can be installed easily
-    try:
-        subprocess.run(["pip", "install", "--quiet"] + libs, check=True)
-    except Exception as e:
-        print(f"Warning: Error during installation: {e}")
-
 def setup_directories(config):
     # Handle /content for Colab
     if os.path.exists("/content"):
         config.base_dir = Path("/content/prometheus_runs")
+    else:
+        config.base_dir = Path("./prometheus_runs")
 
     run_dir = config.base_dir / config.run_id
     for sub in ['checkpoints', 'metrics', 'games', 'logs']:
         (run_dir / sub).mkdir(parents=True, exist_ok=True)
 
-    # Create a link to latest
-    latest_link = config.base_dir / 'latest'
-    if latest_link.exists():
-        if latest_link.is_symlink(): latest_link.unlink()
-        else: shutil.rmtree(latest_link)
-
-    # In Colab, we can't always symlink. Let's just use it as a name.
-    # We'll handle 'latest' logic in CP manager.
-    pass
-
-def start_dashboard(port):
+def start_dashboard(port, run_dir):
     print(f"🚀 Starting Streamlit Dashboard on port {port}...")
     # Start streamlit as a subprocess
     process = subprocess.Popen([
@@ -51,36 +31,53 @@ def start_dashboard(port):
     return process
 
 def main():
-    print("🔥 PROMETHEUS-TQFD Dual Chess AI Training System")
+    print("=" * 60)
+    print("🔥 PROMETHEUS-TQFD v2.0")
+    print("   Dual-AI Tabula Rasa Chess Training System")
+    print("=" * 60)
 
-    # mp setup
+    # 1. mp setup
     mp.set_start_method('spawn', force=True)
 
-    # 1. Hardware Detection
+    # 2. Hardware Detection
     from prometheus_tqfd.utils.hardware import detect_hardware
     hw = detect_hardware()
-    print(f"📊 Hardware: {hw['device'].upper()} - {hw['gpu_name']}")
+    print(f"\n📊 Hardware erkannt:")
+    print(f"   Device: {hw.device}")
+    if hw.gpu_name:
+        print(f"   GPU: {hw.gpu_name} ({hw.vram_gb:.1f} GB VRAM)")
+    print(f"   RAM: {hw.ram_gb:.1f} GB")
 
-    # 2. Config
+    # 3. Config
     from prometheus_tqfd.config import PrometheusConfig, adjust_config_for_hardware
     config = PrometheusConfig()
+    config = adjust_config_for_hardware(config, hw)
 
-    # Google Drive Mount
-    if os.path.exists("/content") and config.use_drive:
+    # 4. Setup Directories
+    setup_directories(config)
+    run_dir = config.base_dir / config.run_id
+
+    # 5. Smoke Tests
+    from prometheus_tqfd.tests import run_smoke_tests
+    if not run_smoke_tests():
+        print("⛔ Smoke Tests failed. Training aborted.")
+        return
+
+    # 6. Google Drive Mount (if in Colab)
+    if hw.is_colab and config.use_drive:
         try:
             from google.colab import drive
             drive.mount('/content/drive')
+            print("✅ Google Drive gemountet")
         except:
-            print("⚠️ Could not mount Google Drive.")
-    config = adjust_config_for_hardware(config)
+            print("⚠️ Google Drive nicht verfügbar")
+            config.use_drive = False
 
-    # 3. Setup Directories
-    setup_directories(config)
+    # 7. Start Dashboard
+    dashboard_proc = start_dashboard(config.dashboard_port, run_dir)
 
-    # 4. Start Dashboard & Tunnel
-    dashboard_proc = start_dashboard(config.dashboard_port)
+    # 8. Setup Tunnel
     from prometheus_tqfd.utils.tunneling import setup_tunnel
-    # Try to get ngrok token from environment or secrets
     ngrok_token = os.environ.get('NGROK_TOKEN')
     try:
         from google.colab import userdata
@@ -88,14 +85,15 @@ def main():
     except:
         pass
 
-    public_url = setup_tunnel(config.dashboard_port, ngrok_token=ngrok_token)
-    print(f"✅ Dashboard URL: {public_url}")
+    url = setup_tunnel(config.dashboard_port, ngrok_token=ngrok_token)
+    if url:
+        print(f"🌐 Dashboard URL: {url}")
 
-    # 5. Start Supervisor
+    # 9. Start Supervisor
     from prometheus_tqfd.orchestration.supervisor import Supervisor
     supervisor = Supervisor(config)
 
-    print("\n🚀 Starting Training...")
+    print("\n🚀 Starting Training Loop...")
     try:
         supervisor.run()
     except KeyboardInterrupt:
