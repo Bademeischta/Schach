@@ -1,139 +1,158 @@
 import torch
 import json
-import shutil
-import pickle
-import lz4.frame
+import time
 import random
 import numpy as np
+import pickle
+import lz4.frame
 from pathlib import Path
 from datetime import datetime
-import uuid
+from typing import Optional, Dict
+from prometheus_tqfd.config import PrometheusConfig
 
 class CheckpointManager:
-    def __init__(self, config):
+    """
+    Tiered Checkpoint-System: Micro (5min), Light (15min), Full (60min).
+    """
+
+    def __init__(self, config: PrometheusConfig):
         self.config = config
-        self.run_dir = config.base_dir / config.run_id
-        self.checkpoint_dir = self.run_dir / 'checkpoints'
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.base_path = config.base_dir / config.run_id / 'checkpoints'
+        self.base_path.mkdir(parents=True, exist_ok=True)
 
-    def save(self, content, type='light'):
+        # drive path if used
+        self.drive_path = Path('/content/drive/MyDrive/prometheus_chess') / config.run_id / 'checkpoints' if config.use_drive else None
+        if self.drive_path:
+            self.drive_path.mkdir(parents=True, exist_ok=True)
+
+        self.last_micro = time.time()
+        self.last_light = time.time()
+        self.last_full = time.time()
+
+    def maybe_checkpoint(self, shared_values: dict, replay_buffers: dict = None):
+        now = time.time()
+
+        if now - self.last_full > self.config.checkpoint_full_interval * 60:
+            self.save_full(shared_values, replay_buffers)
+            self.last_full = now
+            self.last_light = now
+            self.last_micro = now
+        elif now - self.last_light > self.config.checkpoint_light_interval * 60:
+            self.save_light(shared_values)
+            self.last_light = now
+            self.last_micro = now
+        elif now - self.last_micro > self.config.checkpoint_micro_interval * 60:
+            self.save_micro(shared_values)
+            self.last_micro = now
+
+    def save_micro(self, shared_values: dict):
+        path = self.base_path / 'latest'
+        path.mkdir(exist_ok=True)
+
+        if 'atlas_weights' in shared_values:
+            torch.save(shared_values['atlas_weights'], path / 'atlas_weights.pt')
+        if 'entropy_weights' in shared_values:
+            torch.save(shared_values['entropy_weights'], path / 'entropy_weights.pt')
+
+        metadata = {
+            'type': 'micro',
+            'timestamp': datetime.now().isoformat(),
+            'atlas_steps': shared_values.get('atlas_steps', 0),
+            'entropy_steps': shared_values.get('entropy_steps', 0),
+            'atlas_version': shared_values.get('atlas_version', 0),
+            'entropy_version': shared_values.get('entropy_version', 0),
+        }
+        with open(path / 'metadata.json', 'w') as f:
+            json.dump(metadata, f)
+
+    def save_light(self, shared_values: dict):
+        self.save_micro(shared_values)
+        path = self.base_path / 'latest'
+
+        if 'atlas_optimizer' in shared_values:
+            torch.save(shared_values['atlas_optimizer'], path / 'atlas_optimizer.pt')
+        if 'entropy_optimizer' in shared_values:
+            torch.save(shared_values['entropy_optimizer'], path / 'entropy_optimizer.pt')
+
+        rng_states = {
+            'python': random.getstate(),
+            'numpy': np.random.get_state(),
+            'torch': torch.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            rng_states['cuda'] = torch.cuda.get_rng_state()
+        torch.save(rng_states, path / 'rng_states.pt')
+
+        with open(path / 'metadata.json', 'r') as f:
+            metadata = json.load(f)
+        metadata['type'] = 'light'
+        with open(path / 'metadata.json', 'w') as f:
+            json.dump(metadata, f)
+
+    def save_full(self, shared_values: dict, replay_buffers: dict = None):
+        self.save_light(shared_values)
+        path = self.base_path / 'latest'
+
+        if replay_buffers:
+            for name, buffer in replay_buffers.items():
+                with lz4.frame.open(path / f'{name}_replay.lz4', 'wb') as f:
+                    pickle.dump(buffer.get_data(), f)
+
+        with open(path / 'metadata.json', 'r') as f:
+            metadata = json.load(f)
+        metadata['type'] = 'full'
+        with open(path / 'metadata.json', 'w') as f:
+            json.dump(metadata, f)
+
+        # Archive current 'latest' to a timestamped folder
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        cp_path = self.checkpoint_dir / f"checkpoint_{type}_{timestamp}"
-        cp_path.mkdir(exist_ok=True)
+        archive_path = self.base_path / f'full_{timestamp}'
+        import shutil
+        shutil.copytree(path, archive_path)
 
+        # Sync to drive if enabled
+        if self.drive_path:
+            drive_latest = self.drive_path / 'latest'
+            if drive_latest.exists(): shutil.rmtree(drive_latest)
+            shutil.copytree(path, drive_latest)
+            print(f"💾 Checkpoint mirrored to Google Drive")
+
+    def load_latest(self) -> Optional[dict]:
+        path = self.base_path / 'latest'
+        # If not local, check drive
+        if not path.exists() and self.drive_path:
+            drive_path = self.drive_path / 'latest'
+            if drive_path.exists():
+                import shutil
+                shutil.copytree(drive_path, path)
+                print("📂 Restored checkpoint from Google Drive")
+
+        if not path.exists():
+            return None
+
+        data = {}
         try:
-            # Models (always saved)
-            if content.get('atlas_model'):
-                torch.save(content['atlas_model'], cp_path / 'atlas_model.pt')
-            if content.get('entropy_model'):
-                torch.save(content['entropy_model'], cp_path / 'entropy_model.pt')
-
-            if type in ['light', 'full']:
-                if content.get('atlas_opt'): torch.save(content['atlas_opt'], cp_path / 'atlas_opt.pt')
-                if content.get('entropy_opt'): torch.save(content['entropy_opt'], cp_path / 'entropy_opt.pt')
-
-                # RNG states
-                rng_states = {
-                    'torch': torch.get_rng_state(),
-                    'numpy': np.random.get_state(),
-                    'python': random.getstate()
-                }
-                if torch.cuda.is_available():
-                    rng_states['cuda'] = torch.cuda.get_rng_state_all()
-                torch.save(rng_states, cp_path / 'rng_states.pt')
-
-                metadata = {
-                    'atlas_step': content.get('atlas_step', 0),
-                    'entropy_step': content.get('entropy_step', 0),
-                    'atlas_games': content.get('atlas_games', 0),
-                    'entropy_games': content.get('entropy_games', 0),
-                    'timestamp': timestamp,
-                    'type': type,
-                    'config': vars(self.config) if hasattr(self.config, '__dict__') else {}
-                }
-                with open(cp_path / 'metadata.json', 'w') as f:
-                    json.dump(metadata, f, indent=2, default=str)
-
-            if type == 'full':
-                # Replay buffers
-                if content.get('atlas_replay'):
-                    with lz4.frame.open(cp_path / 'atlas_replay.lz4', 'wb') as f:
-                        pickle.dump(content['atlas_replay'], f)
-                if content.get('entropy_replay'):
-                    with lz4.frame.open(cp_path / 'entropy_replay.lz4', 'wb') as f:
-                        pickle.dump(content['entropy_replay'], f)
-
-            # Pointer update
-            with open(self.checkpoint_dir / 'latest_pointer.json', 'w') as f:
-                json.dump({'path': str(cp_path), 'type': type}, f)
-
-            # Rotation
-            self._rotate_checkpoints()
-
-            # If use_drive, copy to drive
-            if self.config.use_drive:
-                self._sync_to_drive(cp_path)
-
+            if (path / 'atlas_weights.pt').exists():
+                data['atlas_weights'] = torch.load(path / 'atlas_weights.pt')
+            if (path / 'entropy_weights.pt').exists():
+                data['entropy_weights'] = torch.load(path / 'entropy_weights.pt')
+            if (path / 'atlas_optimizer.pt').exists():
+                data['atlas_optimizer'] = torch.load(path / 'atlas_optimizer.pt')
+            if (path / 'entropy_optimizer.pt').exists():
+                data['entropy_optimizer'] = torch.load(path / 'entropy_optimizer.pt')
+            if (path / 'rng_states.pt').exists():
+                data['rng_states'] = torch.load(path / 'rng_states.pt')
+            if (path / 'metadata.json').exists():
+                with open(path / 'metadata.json', 'r') as f:
+                    data['metadata'] = json.load(f)
+            return data
         except Exception as e:
-            print(f"Error saving checkpoint: {e}")
-            import traceback
-            traceback.print_exc()
-
-    def _rotate_checkpoints(self):
-        cps = sorted(list(self.checkpoint_dir.glob('checkpoint_*')), key=lambda x: x.stat().st_mtime)
-        while len(cps) > self.config.checkpoint_keep_n:
-            oldest = cps.pop(0)
-            shutil.rmtree(oldest, ignore_errors=True)
-
-    def _sync_to_drive(self, cp_path):
-        drive_path = Path('/content/drive/MyDrive/prometheus_chess') / self.config.run_id / 'checkpoints' / cp_path.name
-        drive_path.mkdir(parents=True, exist_ok=True)
-        # Copy files (only models/metadata for light, everything for full)
-        for f in cp_path.iterdir():
-            shutil.copy2(f, drive_path / f.name)
-
-    def load_latest(self):
-        pointer_file = self.checkpoint_dir / 'latest_pointer.json'
-        if not pointer_file.exists():
+            print(f"⚠️ Error loading checkpoint: {e}")
             return None
 
-        with open(pointer_file, 'r') as f:
-            pointer = json.load(f)
-
-        cp_path = Path(pointer['path'])
-        if not cp_path.exists():
-            return None
-
-        print(f"🔄 Loading checkpoint from {cp_path}")
-        content = {}
-        if (cp_path / 'atlas_model.pt').exists():
-            content['atlas_model'] = torch.load(cp_path / 'atlas_model.pt', map_location='cpu', weights_only=False)
-        if (cp_path / 'entropy_model.pt').exists():
-            content['entropy_model'] = torch.load(cp_path / 'entropy_model.pt', map_location='cpu', weights_only=False)
-
-        if (cp_path / 'atlas_opt.pt').exists():
-            content['atlas_opt'] = torch.load(cp_path / 'atlas_opt.pt', map_location='cpu', weights_only=False)
-        if (cp_path / 'entropy_opt.pt').exists():
-            content['entropy_opt'] = torch.load(cp_path / 'entropy_opt.pt', map_location='cpu', weights_only=False)
-
-        if (cp_path / 'rng_states.pt').exists():
-            rng_states = torch.load(cp_path / 'rng_states.pt', map_location='cpu', weights_only=False)
-            torch.set_rng_state(rng_states['torch'])
-            np.random.set_state(rng_states['numpy'])
-            random.setstate(rng_states['python'])
-            if 'cuda' in rng_states and torch.cuda.is_available():
-                torch.cuda.set_rng_state_all(rng_states['cuda'])
-            content['rng_states'] = rng_states
-
-        if (cp_path / 'metadata.json').exists():
-            with open(cp_path / 'metadata.json', 'r') as f:
-                content['metadata'] = json.load(f)
-
-        if (cp_path / 'atlas_replay.lz4').exists():
-            with lz4.frame.open(cp_path / 'atlas_replay.lz4', 'rb') as f:
-                content['atlas_replay'] = pickle.load(f)
-        if (cp_path / 'entropy_replay.lz4').exists():
-            with lz4.frame.open(cp_path / 'entropy_replay.lz4', 'rb') as f:
-                content['entropy_replay'] = pickle.load(f)
-
-        return content
+    def load_replay_buffer(self, name: str) -> Optional[list]:
+        path = self.base_path / 'latest' / f'{name}_replay.lz4'
+        if path.exists():
+            with lz4.frame.open(path, 'rb') as f:
+                return pickle.load(f)
+        return None

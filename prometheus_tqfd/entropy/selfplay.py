@@ -1,97 +1,146 @@
+import time
 import torch
 import chess
-import random
-import numpy as np
-from prometheus_tqfd.entropy.fields import FieldCalculator
-from prometheus_tqfd.entropy.network import build_graph_data, HAS_PYG
+from typing import List, Dict, Tuple
+from multiprocessing import Queue, Event
+from prometheus_tqfd.config import PrometheusConfig
+from prometheus_tqfd.entropy.network import EntropyNetworkV2
+from prometheus_tqfd.entropy.rollout import MiniRolloutSelector
+from prometheus_tqfd.tactics import TacticsDetector
 from prometheus_tqfd.encoding import BoardEncoder, MoveEncoder
+from prometheus_tqfd.physics import PhysicsFieldCalculator
 
 class EntropySelfPlayWorker:
-    def __init__(self, config, weights_queue, data_queue, stop_event, worker_id):
+    """
+    Generiert Self-Play-Spiele mit Mini-Rollouts.
+    """
+
+    def __init__(self, config: PrometheusConfig, weights_queue: Queue,
+                 data_queue: Queue, device: str, worker_id: int):
         self.config = config
         self.weights_queue = weights_queue
         self.data_queue = data_queue
-        self.stop_event = stop_event
+        self.device = device
         self.worker_id = worker_id
 
-        from prometheus_tqfd.entropy.network import EntropyNetwork
-        self.network = EntropyNetwork(config).to(config.actor_device)
+        self.network = EntropyNetworkV2(config).to(device)
         self.network.eval()
+        self.tactics = TacticsDetector(config)
+        self.selector = MiniRolloutSelector(config, self.network, self.tactics, device)
 
-        self.field_calc = FieldCalculator(config.physics)
-        self.board_encoder = BoardEncoder()
+        self.encoder = BoardEncoder()
+        self.field_calc = PhysicsFieldCalculator(config)
         self.move_encoder = MoveEncoder()
 
-        self.temperature = config.entropy_temp_start
+        self.temperature = config.entropy_temperature_start
+        self.games_played = 0
+        self.weights_version = 0
 
-    def run(self):
-        print(f"Entropy Worker {self.worker_id} started.")
-        while not self.stop_event.is_set():
-            if not self.weights_queue.empty():
-                try:
-                    self.network.load_state_dict(self.weights_queue.get_nowait())
-                except:
-                    pass
+    def run(self, stop_event: Event, heartbeat_dict: Dict):
+        """Hauptschleife"""
+        while not stop_event.is_set():
+            heartbeat_dict[f'entropy_selfplay_{self.worker_id}'] = time.time()
 
+            self._maybe_update_weights()
             trajectory = self._play_game()
             self.data_queue.put(trajectory)
 
-            # Anneal temperature
-            self.temperature = max(self.config.entropy_temp_end, self.temperature * self.config.entropy_temp_decay)
+            self.games_played += 1
+            self._decay_temperature()
 
-    def _play_game(self):
-        board = chess.Board()
+    def _play_game(self) -> List[Dict]:
+        """Spiele ein komplettes Spiel"""
         trajectory = []
+        board = chess.Board()
 
-        while not board.is_game_over() and not self.stop_event.is_set():
-            field_tensor = self.field_calc.compute_fields(board).unsqueeze(0).to(self.config.actor_device)
-            if self.network.has_pyg:
-                board_data = build_graph_data(board)
-                if board_data: board_data = board_data.to(self.config.actor_device)
-            else:
-                board_data = self.board_encoder.encode(board).unsqueeze(0).to(self.config.actor_device)
+        while not board.is_game_over() and len(trajectory) < 400:
+            # Daten für diesen Zug
+            step_data = self._collect_step_data(board)
 
-            mask = self.move_encoder.get_legal_mask(board).unsqueeze(0).to(self.config.actor_device)
+            # Zug wählen
+            move, energy_before = self.selector.select_move(board, self.temperature)
+            if move is None: break
 
-            with torch.no_grad():
-                probs, energy, _, _ = self.network(field_tensor, board_data, mask)
+            step_data['move_idx'] = self.move_encoder.move_to_index(move)
+            step_data['energy_before'] = energy_before
 
-            # Boltzmann sampling
-            probs = probs[0].cpu().numpy()
-            legal_moves = list(board.legal_moves)
-            legal_indices = [self.move_encoder.move_to_index(m) for m in legal_moves]
-
-            p_legal = probs[legal_indices]
-            p_legal = np.maximum(p_legal, 1e-8)
-
-            # Apply temperature
-            logits = np.log(p_legal) / self.temperature
-            exp_logits = np.exp(logits - np.max(logits))
-            p_final = exp_logits / exp_logits.sum()
-
-            move_idx = np.random.choice(len(legal_moves), p=p_final)
-            move = legal_moves[move_idx]
-
-            # Opponent legal count for entropy loss
-            temp_board = board.copy()
-            temp_board.push(move)
-            opp_legal_count = temp_board.legal_moves.count()
-
-            # Energy captured
-            captured_piece = board.piece_at(move.to_square)
-            e_captured = self.field_calc.piece_energies[captured_piece.piece_type] if captured_piece else 0.0
-
-            step_data = {
-                'field': field_tensor.cpu().squeeze(0),
-                'board': board_data.x.cpu() if self.network.has_pyg else board_data.cpu().squeeze(0),
-                'mask': mask.cpu().squeeze(0),
-                'opp_legal_count': opp_legal_count,
-                'e_captured': e_captured,
-                'energy_before': energy.item(),
-                'board_obj': board.copy() # For later building pairs
-            }
-
-            trajectory.append(step_data)
+            # Zug ausführen
             board.push(move)
 
+            # Energie nach Zug
+            step_data['energy_after'] = self._get_energy(board)
+            step_data['legal_count_opponent'] = len(list(board.legal_moves))
+
+            trajectory.append(step_data)
+
+        # Spielergebnis hinzufügen
+        result = self._get_result(board)
+        for i, step in enumerate(trajectory):
+            # Perspective: results are usually 1 for White win.
+            # If step i is White's turn (i=0, 2...), perspective is 1.
+            perspective = 1 if i % 2 == 0 else -1
+            step['game_result'] = result * perspective
+
         return trajectory
+
+    def _collect_step_data(self, board: chess.Board) -> Dict:
+        """Sammle alle Daten für einen Zug"""
+        board_tensor = self.encoder.encode(board)
+        field_tensor = self.field_calc.compute(board)
+
+        # Features for RND
+        with torch.no_grad():
+            features = self.network.get_features(
+                board_tensor.unsqueeze(0).to(self.device),
+                field_tensor.unsqueeze(0).to(self.device)
+            ).squeeze(0).cpu()
+
+            # Also need policy logits for mobility loss
+            policy_logits, _ = self.network(
+                board_tensor.unsqueeze(0).to(self.device),
+                field_tensor.unsqueeze(0).to(self.device)
+            )
+            policy_logits = policy_logits.squeeze(0).cpu()
+
+        return {
+            'board_tensor': board_tensor,
+            'field_tensor': field_tensor,
+            'features': features,
+            'policy_logits': policy_logits,
+            'legal_count_self': len(list(board.legal_moves)),
+        }
+
+    def _get_energy(self, board: chess.Board) -> float:
+        board_tensor = self.encoder.encode(board).unsqueeze(0).to(self.device)
+        field_tensor = self.field_calc.compute(board).unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            _, energy = self.network(board_tensor, field_tensor)
+        return energy.item()
+
+    def _get_result(self, board: chess.Board) -> float:
+        result = board.result()
+        if result == "1-0":
+            return 1.0
+        elif result == "0-1":
+            return -1.0
+        return 0.0
+
+    def _decay_temperature(self):
+        self.temperature = max(
+            self.config.entropy_temperature_end,
+            self.temperature * self.config.entropy_temperature_decay
+        )
+
+    def _maybe_update_weights(self):
+        try:
+            latest = None
+            while not self.weights_queue.empty():
+                latest = self.weights_queue.get_nowait()
+            if latest:
+                weights, version = latest
+                if version > self.weights_version:
+                    self.network.load_state_dict(weights)
+                    self.weights_version = version
+        except:
+            pass

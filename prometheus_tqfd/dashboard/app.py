@@ -1,68 +1,114 @@
 import streamlit as st
-import pandas as pd
+import plotly.graph_objects as go
 import json
+import os
 import time
 from pathlib import Path
-import plotly.express as px
-from prometheus_tqfd.dashboard.heatmaps import render_heatmap
+from typing import List, Dict
 
-st.set_page_config(page_title="PROMETHEUS-TQFD Dashboard", layout="wide")
+st.set_page_config(
+    page_title="PROMETHEUS-TQFD Dashboard",
+    page_icon="♟️",
+    layout="wide"
+)
 
-st.title("🔥 PROMETHEUS-TQFD Chess Training")
+def find_latest_metrics_file(base_dir: Path):
+    # This is a simplified version, in reality we'd look into the run_id/metrics/ folder
+    metrics_files = list(base_dir.glob("**/metrics/*.jsonl"))
+    if not metrics_files:
+        return None
+    return max(metrics_files, key=os.path.getmtime)
 
-# Sidebar
-st.sidebar.header("Controls")
-if st.sidebar.button("Checkpoint Now"):
-    pass # Send signal to supervisor
-if st.sidebar.button("Pause/Resume"):
-    pass
+@st.cache_data(ttl=2)
+def load_metrics(metrics_file):
+    if not metrics_file or not os.path.exists(metrics_file):
+        return []
 
-# Load Metrics
-# We should find the latest run_id
-def get_latest_run_dir():
-    base = Path("/content/prometheus_runs")
-    if not base.exists(): return None
-    runs = sorted([d for d in base.iterdir() if d.is_dir()], key=lambda x: x.name, reverse=True)
-    return runs[0] if runs else None
-
-run_dir = get_latest_run_dir()
-metrics_file = run_dir / "metrics" / "metrics.jsonl" if run_dir else None
-
-def load_metrics():
-    if not metrics_file or not metrics_file.exists(): return []
-    data = []
+    metrics = []
     with open(metrics_file, 'r') as f:
         for line in f:
-            data.append(json.loads(line))
-    return data
+            try:
+                metrics.append(json.loads(line))
+            except:
+                pass
+    return metrics[-10000:]
 
-metrics = load_metrics()
+def get_elo(name: str, metrics: List[Dict]) -> float:
+    for m in reversed(metrics):
+        if m.get('type') == 'evaluation' and 'elo' in m:
+            return m['elo'].get(name, 1000.0)
+    return 1000.0
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["Overview", "Learning Curves", "Heatmaps", "Live Game", "Physics Tuning"])
+def get_games(name: str, metrics: List[Dict]) -> int:
+    # Estimate from training steps if games not explicit
+    count = 0
+    for m in metrics:
+        if m.get('type') == f'{name}_train':
+            count += 1
+    return count
 
-with tab1:
-    col1, col2, col3 = st.columns(3)
-    # Placeholder for real values
-    col1.metric("ATLAS ELO", "1000")
-    col2.metric("ENTROPY ELO", "1000")
-    col3.metric("Games Played", len([m for m in metrics if m.get('type') == 'duel']))
+def main():
+    st.title("♟️ PROMETHEUS-TQFD")
+    st.markdown("### Dual-AI Tabula Rasa Chess Training")
 
-with tab2:
-    st.subheader("Loss Curves")
-    atlas_metrics = [m for m in metrics if m.get('type') == 'atlas_metrics']
-    if atlas_metrics:
-        df_atlas = pd.DataFrame(atlas_metrics)
-        st.line_chart(df_atlas.set_index('step')[['loss', 'policy_loss', 'value_loss']])
+    # In a real setup, base_dir comes from environment or config
+    base_dir = Path("./prometheus_runs")
+    metrics_file = find_latest_metrics_file(base_dir)
+    metrics = load_metrics(metrics_file)
 
-    entropy_metrics = [m for m in metrics if m.get('type') == 'entropy_metrics']
-    if entropy_metrics:
-        df_entropy = pd.DataFrame(entropy_metrics)
-        st.line_chart(df_entropy.set_index('step')[['loss', 'l_entropy', 'l_conservation', 'l_td']])
+    # Sidebar
+    with st.sidebar:
+        st.markdown("### System Status")
+        st.metric("ATLAS ELO", f"{get_elo('atlas', metrics):.0f}")
+        st.metric("ENTROPY ELO", f"{get_elo('entropy', metrics):.0f}")
+        st.markdown("---")
+        st.metric("ATLAS Progress", f"{get_games('atlas', metrics)} steps")
+        st.metric("ENTROPY Progress", f"{get_games('entropy', metrics)} steps")
 
-with tab5:
-    st.subheader("Thermodynamic Constants")
-    # This tab would allow adjusting physics via a config file that supervisor watches
-    st.slider("Diffusion Sigma (σ)", 0.1, 5.0, 2.5)
-    st.slider("Energy King", 100.0, 2000.0, 1000.0)
+        if st.button("Refresh"):
+            st.rerun()
 
-st.sidebar.text(f"Uptime: {time.time():.0f}")
+    # Tabs
+    tab1, tab2, tab3 = st.tabs(["📈 Lernkurven", "🔥 Heatmaps", "🎮 Live-Spiel"])
+
+    with tab1:
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.subheader("ATLAS Training")
+            atlas_metrics = [m for m in metrics if m.get('type') == 'atlas_train']
+            if atlas_metrics:
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    y=[m['loss'] for m in atlas_metrics[-1000:]],
+                    name='Total Loss'
+                ))
+                fig.update_layout(yaxis_type="log", title="Atlas Total Loss")
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No ATLAS metrics yet.")
+
+        with col2:
+            st.subheader("ENTROPY Training")
+            entropy_metrics = [m for m in metrics if m.get('type') == 'entropy_train']
+            if entropy_metrics:
+                fig = go.Figure()
+                for key in ['outcome', 'mobility', 'pressure', 'stability', 'novelty']:
+                    if key in entropy_metrics[0]:
+                        fig.add_trace(go.Scatter(
+                            y=[m.get(key, 0) for m in entropy_metrics[-1000:]],
+                            name=key
+                        ))
+                fig.update_layout(yaxis_type="log", title="Entropy Hybrid Losses")
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No ENTROPY metrics yet.")
+
+    with tab2:
+        st.info("Heatmaps will be implemented soon.")
+
+    with tab3:
+        st.info("Live-game view coming soon.")
+
+if __name__ == '__main__':
+    main()
