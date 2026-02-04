@@ -36,24 +36,28 @@ class EntropySelfPlayWorker:
         self.games_played = 0
         self.weights_version = 0
 
-    def run(self, stop_event: Event, heartbeat_dict: Dict):
+    def run(self, stop_event: Event, heartbeat_dict: Dict, metrics_queue: Queue = None):
         """Hauptschleife"""
         while not stop_event.is_set():
             heartbeat_dict[f'entropy_selfplay_{self.worker_id}'] = time.time()
 
             self._maybe_update_weights()
-            trajectory = self._play_game()
+            trajectory = self._play_game(metrics_queue)
             self.data_queue.put(trajectory)
 
             self.games_played += 1
             self._decay_temperature()
 
-    def _play_game(self) -> List[Dict]:
+    def _play_game(self, metrics_queue: Queue = None) -> List[Dict]:
         """Spiele ein komplettes Spiel"""
         trajectory = []
         board = chess.Board()
 
         while not board.is_game_over() and len(trajectory) < 400:
+            # Periodic dashboard update
+            if metrics_queue and len(trajectory) % 10 == 0:
+                self._send_dashboard_update(metrics_queue, board)
+
             # Daten für diesen Zug
             step_data = self._collect_step_data(board)
 
@@ -117,6 +121,19 @@ class EntropySelfPlayWorker:
         with torch.no_grad():
             _, energy = self.network(board_tensor, field_tensor)
         return energy.item()
+
+    def _send_dashboard_update(self, metrics_queue, board):
+        from prometheus_tqfd.dashboard.heatmaps import get_entropy_heatmap
+        field_tensor = self.field_calc.compute(board)
+        heatmap = get_entropy_heatmap(field_tensor)
+        metrics_queue.put({
+            'type': 'entropy_metrics',
+            'heatmap': heatmap.tolist(),
+            'fen': board.fen(),
+            'event': 'move',
+            'player': 'ENTROPY',
+            'move': board.move_stack[-1].uci() if board.move_stack else 'None'
+        })
 
     def _get_result(self, board: chess.Board) -> float:
         result = board.result()

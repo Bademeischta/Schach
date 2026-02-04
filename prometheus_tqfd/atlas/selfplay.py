@@ -30,7 +30,7 @@ class AtlasSelfPlayWorker:
         self.games_played = 0
         self.weights_version = 0
 
-    def run(self, stop_event: Event, heartbeat_dict: Dict):
+    def run(self, stop_event: Event, heartbeat_dict: Dict, metrics_queue: Queue = None):
         """Hauptschleife des Workers"""
         while not stop_event.is_set():
             # Heartbeat
@@ -40,7 +40,7 @@ class AtlasSelfPlayWorker:
             self._maybe_update_weights()
 
             # Spiel spielen
-            trajectory = self._play_game()
+            trajectory = self._play_game(metrics_queue)
 
             # In Queue schieben
             self.data_queue.put(trajectory)
@@ -62,13 +62,16 @@ class AtlasSelfPlayWorker:
         except:
             pass
 
-    def _play_game(self) -> List[Tuple[torch.Tensor, torch.Tensor, float]]:
+    def _play_game(self, metrics_queue: Queue = None) -> List[Tuple[torch.Tensor, torch.Tensor, float]]:
         """Spiele ein komplettes Spiel"""
         trajectory = []
         board = chess.Board()
         move_count = 0
 
         while not board.is_game_over():
+            # Heartbeat inside loop for long games
+            # ...
+
             # Temperatur-Schedule
             if move_count < self.config.atlas_temperature_moves:
                 temperature = self.config.atlas_temperature_init
@@ -77,6 +80,10 @@ class AtlasSelfPlayWorker:
 
             # MCTS
             root = self.mcts.search(board)
+
+            # Periodic dashboard update
+            if metrics_queue and move_count % 10 == 0:
+                self._send_dashboard_update(metrics_queue, board, root)
 
             # Daten sammeln
             state_tensor = self.encoder.encode(board)
@@ -106,6 +113,18 @@ class AtlasSelfPlayWorker:
             final_trajectory.append((trajectory[i][0], trajectory[i][1], value_target))
 
         return final_trajectory
+
+    def _send_dashboard_update(self, metrics_queue, board, root):
+        from prometheus_tqfd.dashboard.heatmaps import get_atlas_heatmap
+        heatmap = get_atlas_heatmap(root)
+        metrics_queue.put({
+            'type': 'atlas_metrics',
+            'heatmap': heatmap.tolist(),
+            'fen': board.fen(),
+            'event': 'move',
+            'player': 'ATLAS',
+            'move': board.move_stack[-1].uci() if board.move_stack else 'None'
+        })
 
     def _get_result(self, board: chess.Board) -> float:
         """Spielergebnis aus Weiß-Perspektive"""
